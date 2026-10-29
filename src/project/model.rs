@@ -547,7 +547,30 @@ impl Default for Zoom {
 }
 
 impl Zoom {
-    pub const MIN_LEN_MS: f64 = 1000.0;
+    /// Shortest a zoom can be made by trimming or splitting.
+    pub const MIN_LEN_MS: f64 = 500.0;
+    /// Length of a zoom added at the playhead.
+    pub const DEFAULT_LEN_MS: f64 = 2500.0;
+
+    /// Move the start edge to `t`. The zoom keeps at least `MIN_LEN_MS` (one
+    /// already shorter than that can only grow) and stays inside the recording.
+    pub fn trim_start(&mut self, t: f64) {
+        let hi = (self.end - Self::MIN_LEN_MS).max(self.start).min(self.end);
+        self.start = t.clamp(0.0, hi.max(0.0));
+    }
+
+    /// Move the end edge to `t`, for a recording `duration` ms long.
+    pub fn trim_end(&mut self, t: f64, duration: f64) {
+        let lo = (self.start + Self::MIN_LEN_MS).min(self.end);
+        self.end = t.clamp(lo, duration.max(lo));
+    }
+
+    /// Move the whole zoom so it starts at `t`, keeping its length.
+    pub fn move_to(&mut self, t: f64, duration: f64) {
+        let len = self.end - self.start;
+        self.start = t.clamp(0.0, (duration - len).max(0.0));
+        self.end = self.start + len;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -674,6 +697,32 @@ impl Timeline {
     pub fn new_id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
+    }
+
+    /// Add a zoom starting at source time `at`, `Zoom::DEFAULT_LEN_MS` long
+    /// but never past the end of a `duration` ms recording or shorter than
+    /// `Zoom::MIN_LEN_MS` (it starts earlier when `at` is too close to the end).
+    pub fn add_zoom(&mut self, at: f64, scale: f64, duration: f64) -> u64 {
+        let id = self.new_id();
+        let start = at.clamp(0.0, (duration - Zoom::MIN_LEN_MS).max(0.0));
+        let end = (start + Zoom::DEFAULT_LEN_MS).min(duration).max(start);
+        self.zooms.push(Zoom { id, start, end, scale, ..Default::default() });
+        id
+    }
+
+    /// Split zoom `id` at source time `t` into two that share its settings.
+    /// Each half keeps at least `Zoom::MIN_LEN_MS`. Returns the id of the new
+    /// second half, or None when `t` is too close to an end (or no such zoom).
+    pub fn split_zoom(&mut self, id: u64, t: f64) -> Option<u64> {
+        let i = self.zooms.iter().position(|z| z.id == id)?;
+        let z = self.zooms[i];
+        if t < z.start + Zoom::MIN_LEN_MS || t > z.end - Zoom::MIN_LEN_MS {
+            return None;
+        }
+        let new = self.new_id();
+        self.zooms[i].end = t;
+        self.zooms.insert(i + 1, Zoom { id: new, start: t, ..z });
+        Some(new)
     }
 }
 
@@ -900,5 +949,99 @@ mod tests {
         assert_eq!(e.codec_for(4654, 3200), Codec::Hevc);
         assert_eq!(e.codec_for(2160, 3840), Codec::H264);
         assert_eq!(ExportSettings { codec: Codec::Hevc, ..e }.codec_for(1280, 720), Codec::Hevc);
+    }
+
+    fn zoom(start: f64, end: f64) -> Zoom {
+        Zoom { id: 1, start, end, ..Default::default() }
+    }
+
+    #[test]
+    fn trimming_a_zoom_keeps_it_inside_the_recording_and_above_the_minimum() {
+        let mut z = zoom(2000.0, 4000.0);
+        z.trim_start(-500.0);
+        assert_eq!(z.start, 0.0);
+        z.trim_start(9000.0);
+        assert_eq!(z.start, 4000.0 - Zoom::MIN_LEN_MS);
+        z.trim_end(0.0, 10_000.0);
+        assert_eq!(z.end, z.start + Zoom::MIN_LEN_MS);
+        z.trim_end(99_000.0, 10_000.0);
+        assert_eq!(z.end, 10_000.0);
+        assert!(z.end - z.start >= Zoom::MIN_LEN_MS);
+    }
+
+    #[test]
+    fn a_zoom_shorter_than_the_minimum_can_grow_but_not_shrink() {
+        let mut z = zoom(1000.0, 1200.0);
+        z.trim_start(1150.0);
+        assert_eq!(z.start, 1000.0);
+        z.trim_end(1050.0, 5000.0);
+        assert_eq!(z.end, 1200.0);
+        z.trim_start(200.0);
+        z.trim_end(3000.0, 5000.0);
+        assert_eq!((z.start, z.end), (200.0, 3000.0));
+        // One past the end of a short recording is pulled back in, never inverted.
+        let mut z = zoom(100.0, 400.0);
+        z.trim_end(900.0, 300.0);
+        assert!(z.end >= z.start);
+    }
+
+    #[test]
+    fn moving_a_zoom_keeps_its_length_and_stays_inside() {
+        let mut z = zoom(2000.0, 4000.0);
+        z.move_to(-300.0, 10_000.0);
+        assert_eq!((z.start, z.end), (0.0, 2000.0));
+        z.move_to(9500.0, 10_000.0);
+        assert_eq!((z.start, z.end), (8000.0, 10_000.0));
+        // Longer than the recording: pinned at the start rather than panicking.
+        let mut z = zoom(0.0, 3000.0);
+        z.move_to(500.0, 2000.0);
+        assert_eq!(z.start, 0.0);
+    }
+
+    #[test]
+    fn added_zooms_never_run_past_the_end_or_below_the_minimum() {
+        let mut tl = Timeline::default();
+        let a = tl.add_zoom(1000.0, 2.0, 10_000.0);
+        let b = tl.add_zoom(9800.0, 2.0, 10_000.0);
+        let c = tl.add_zoom(10_000.0, 2.0, 10_000.0);
+        let get = |id| *tl.zooms.iter().find(|z| z.id == id).unwrap();
+        assert_eq!((get(a).start, get(a).end), (1000.0, 3500.0));
+        assert_eq!((get(b).start, get(b).end), (10_000.0 - Zoom::MIN_LEN_MS, 10_000.0));
+        assert_eq!(get(c).start, get(b).start);
+        assert!(tl.zooms.iter().all(|z| z.end - z.start >= Zoom::MIN_LEN_MS && z.end <= 10_000.0));
+        // A recording shorter than the minimum still gets a zoom inside it.
+        let mut tl = Timeline::default();
+        let id = tl.add_zoom(100.0, 2.0, 300.0);
+        assert_eq!((tl.zooms[0].id, tl.zooms[0].start, tl.zooms[0].end), (id, 0.0, 300.0));
+    }
+
+    #[test]
+    fn splitting_a_zoom_makes_two_that_share_its_settings() {
+        let mut tl = Timeline::default();
+        let id = tl.new_id();
+        let z = Zoom { id, start: 2000.0, end: 5000.0, scale: 3.0, instant: true, ..Default::default() };
+        tl.zooms.push(z);
+        let new = tl.split_zoom(id, 3500.0).unwrap();
+        assert_ne!(new, id);
+        assert_eq!(tl.zooms.len(), 2);
+        assert_eq!((tl.zooms[0].id, tl.zooms[0].start, tl.zooms[0].end), (id, 2000.0, 3500.0));
+        assert_eq!((tl.zooms[1].id, tl.zooms[1].start, tl.zooms[1].end), (new, 3500.0, 5000.0));
+        assert!(tl.zooms.iter().all(|z| z.scale == 3.0 && z.instant));
+    }
+
+    #[test]
+    fn a_zoom_wont_split_closer_to_an_end_than_the_minimum() {
+        let mut tl = Timeline::default();
+        let id = tl.new_id();
+        tl.zooms.push(Zoom { id, start: 2000.0, end: 4000.0, ..Default::default() });
+        let before = tl.clone();
+        for t in [1000.0, 2000.0, 2000.0 + Zoom::MIN_LEN_MS - 1.0, 4000.0 - Zoom::MIN_LEN_MS + 1.0, 4000.0, 9000.0] {
+            assert_eq!(tl.split_zoom(id, t), None, "{t}");
+        }
+        assert_eq!(tl.split_zoom(99, 3000.0), None);
+        assert_eq!(tl, before);
+        // The boundary itself is allowed: both halves are exactly the minimum.
+        let mut tl = before;
+        assert!(tl.split_zoom(id, 2000.0 + Zoom::MIN_LEN_MS).is_some());
     }
 }
