@@ -15,7 +15,9 @@ fn frame(ctx: &egui::Context, t: f64, f: impl FnMut(&mut egui::Ui)) {
         time: Some(t),
         ..Default::default()
     };
-    let _ = ctx.run_ui(input, f);
+    let mut out = ctx.run_ui(input, f);
+    // Nothing paints this output, and egui panics in debug builds when texture changes are dropped.
+    out.textures_delta.clear();
 }
 
 #[test]
