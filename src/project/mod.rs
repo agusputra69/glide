@@ -26,10 +26,28 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::engine::zoom;
-use model::{DeviceFrame, Project, Slice, Style};
+use model::{DeviceFrame, PROJECT_VERSION, Project, Slice, Style};
 use recording::{Recording, RecordingMeta, SourceKind};
 
 pub const EXTENSION: &str = "glide";
+
+/// `project.json` has a format version newer than this Glide understands.
+#[derive(Debug)]
+pub struct NewerProject {
+    pub found: u64,
+}
+
+impl std::fmt::Display for NewerProject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "this project was saved by a newer Glide (project format {}, this version reads up to {PROJECT_VERSION}); update Glide to open it",
+            self.found
+        )
+    }
+}
+
+impl std::error::Error for NewerProject {}
 
 #[derive(Clone, Debug)]
 pub struct Package {
@@ -64,17 +82,53 @@ impl Package {
         })
     }
 
+    /// Fails with [`NewerProject`] when `project.json` was saved by a newer Glide, since saving it
+    /// again from this version would drop what this version doesn't know about.
     pub fn load_project(&self) -> Result<Project> {
-        read_json(&self.project_file())
+        let path = self.project_file();
+        let value: serde_json::Value = read_json(&path)?;
+        if let Some(found) = value.get("version").and_then(|v| v.as_u64()).filter(|v| *v > PROJECT_VERSION as u64) {
+            return Err(NewerProject { found }.into());
+        }
+        serde_json::from_value(value).with_context(|| format!("parsing {}", path.display()))
     }
 
+    /// A package with no `project.json` yet gets a fresh project. One that can't be read keeps a
+    /// copy of the file beside it before the fresh project replaces it on the next save, and one
+    /// from a newer Glide is an error, so neither is overwritten unseen.
     pub fn load(&self) -> Result<(Project, Recording)> {
         let rec = self.load_recording()?;
+        if !self.project_file().exists() {
+            return Ok((new_project(&self.name(), &rec), rec));
+        }
         let project = match self.load_project() {
             Ok(p) => p,
-            Err(_) => new_project(&self.name(), &rec),
+            Err(e) if e.is::<NewerProject>() => return Err(e),
+            Err(e) => {
+                match self.keep_unreadable_project() {
+                    Some(copy) => eprintln!("{e:#}; kept a copy as {} and started a new project", copy.display()),
+                    None => eprintln!("{e:#}; started a new project"),
+                }
+                new_project(&self.name(), &rec)
+            }
         };
         Ok((project, rec))
+    }
+
+    /// Copies `project.json` to `project.json.broken` (`-2`, `-3`… when that holds different
+    /// content) unless an identical copy is already there. Returns the copy's path.
+    fn keep_unreadable_project(&self) -> Option<PathBuf> {
+        let bytes = fs::read(self.project_file()).ok()?;
+        for n in 1..100 {
+            let name = if n == 1 { "project.json.broken".to_string() } else { format!("project.json.broken-{n}") };
+            let copy = self.root.join(name);
+            match fs::read(&copy) {
+                Ok(existing) if existing == bytes => return Some(copy),
+                Ok(_) => continue,
+                Err(_) => return fs::write(&copy, &bytes).ok().map(|_| copy),
+            }
+        }
+        None
     }
 
     /// Copy a file into the package's `assets/` folder; returns the path
@@ -197,5 +251,75 @@ mod tests {
         assert_eq!(pkg.load_project().unwrap(), p);
         assert_eq!(rec.meta.duration_ms, 1000.0);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A package holding only a recording, in a folder of its own.
+    fn package(name: &str) -> Package {
+        let dir = std::env::temp_dir().join(format!("glide-test-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("recording")).unwrap();
+        let pkg = Package::new(&dir);
+        write_json(&pkg.rec("meta.json"), &RecordingMeta { duration_ms: 1000.0, ..Default::default() }).unwrap();
+        pkg
+    }
+
+    #[test]
+    fn a_package_without_a_project_gets_a_fresh_one_and_no_copy() {
+        let pkg = package("missing");
+        let (p, _) = pkg.load().unwrap();
+        assert_eq!(p.timeline.slices.len(), 1);
+        assert!(!pkg.root.join("project.json.broken").exists());
+        fs::remove_dir_all(&pkg.root).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_project_is_copied_before_it_is_replaced() {
+        let pkg = package("corrupt");
+        let broken = br#"{"name":"my edit","style":{"padding":"#;
+        fs::write(pkg.project_file(), broken).unwrap();
+        let (p, _) = pkg.load().unwrap();
+        assert_eq!(p.timeline.slices.len(), 1, "falls back to a fresh project");
+        assert_eq!(fs::read(pkg.root.join("project.json.broken")).unwrap(), broken);
+        // The next save replaces project.json; the copy keeps the edit.
+        pkg.save_project(&p).unwrap();
+        assert_eq!(fs::read(pkg.root.join("project.json.broken")).unwrap(), broken);
+        fs::remove_dir_all(&pkg.root).unwrap();
+    }
+
+    #[test]
+    fn loading_the_same_unreadable_project_again_adds_no_second_copy() {
+        let pkg = package("corrupt-twice");
+        fs::write(pkg.project_file(), b"not json").unwrap();
+        pkg.load().unwrap();
+        pkg.load().unwrap();
+        assert!(!pkg.root.join("project.json.broken-2").exists());
+        // A different broken file doesn't overwrite the first copy.
+        fs::write(pkg.project_file(), b"also not json").unwrap();
+        pkg.load().unwrap();
+        assert_eq!(fs::read(pkg.root.join("project.json.broken")).unwrap(), b"not json");
+        assert_eq!(fs::read(pkg.root.join("project.json.broken-2")).unwrap(), b"also not json");
+        fs::remove_dir_all(&pkg.root).unwrap();
+    }
+
+    #[test]
+    fn a_project_from_a_newer_glide_is_refused_and_left_alone() {
+        let pkg = package("newer");
+        let newer = format!(r#"{{"version":{},"name":"from the future"}}"#, PROJECT_VERSION + 1);
+        fs::write(pkg.project_file(), &newer).unwrap();
+        let err = pkg.load().unwrap_err();
+        assert_eq!(err.downcast_ref::<NewerProject>().map(|e| e.found), Some(PROJECT_VERSION as u64 + 1));
+        assert!(err.to_string().contains("newer Glide"), "{err}");
+        assert_eq!(fs::read_to_string(pkg.project_file()).unwrap(), newer);
+        assert!(!pkg.root.join("project.json.broken").exists());
+        fs::remove_dir_all(&pkg.root).unwrap();
+    }
+
+    #[test]
+    fn the_current_version_still_loads() {
+        let pkg = package("current");
+        fs::write(pkg.project_file(), format!(r#"{{"version":{PROJECT_VERSION},"name":"kept"}}"#)).unwrap();
+        let (p, _) = pkg.load().unwrap();
+        assert_eq!(p.name, "kept");
+        fs::remove_dir_all(&pkg.root).unwrap();
     }
 }
