@@ -912,17 +912,23 @@ impl Editor {
         }
     }
 
+    /// The zoom target (normalised in the cropped screen) under a point of
+    /// the preview, given as a fraction of its width and height. It goes back
+    /// through the window as drawn right now, zoom and inset included, so it
+    /// names the pixel the user sees under the pointer.
+    pub fn zoom_target_at(&self, at: egui::Vec2) -> Option<crate::engine::geom::Vec2> {
+        let f = self.preview.last_frame.as_ref()?;
+        let scene = &self.preview.scene;
+        let p = scene.output_to_screen(crate::engine::geom::v2(at.x as f64 * f.size.x, at.y as f64 * f.size.y), f.window.rect);
+        let t = scene.sizes.crop.scalar_of(p);
+        Some(crate::engine::geom::v2(t.x.clamp(0.0, 1.0), t.y.clamp(0.0, 1.0)))
+    }
+
     fn pick_zoom_target(&mut self, id: u64, at: egui::Vec2) {
-        // Map the click from output space back to the unzoomed screen.
-        let sizes = self.preview.scene.sizes;
-        let out = egui::vec2(sizes.output.x as f32, sizes.output.y as f32);
-        let px = egui::vec2(at.x * out.x, at.y * out.y);
-        let body = sizes.default_body();
-        let x = ((px.x as f64 - sizes.pad - body.x) / body.w).clamp(0.0, 1.0);
-        let y = ((px.y as f64 - sizes.pad - body.y) / body.h).clamp(0.0, 1.0);
+        let Some(target) = self.zoom_target_at(at) else { return };
         self.edit(|p| {
             if let Some(z) = p.timeline.zooms.iter_mut().find(|z| z.id == id) {
-                z.mode = crate::project::model::ZoomMode::Manual { target: crate::engine::geom::v2(x, y) };
+                z.mode = crate::project::model::ZoomMode::Manual { target };
             }
         });
     }
