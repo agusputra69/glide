@@ -51,3 +51,20 @@ fn a_click_picks_the_screen_point_under_the_pointer_zoomed_or_not() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn the_chosen_point_ends_up_in_the_middle_of_the_zoomed_view() {
+    let (mut ed, dir) = editor("zoom-centre");
+    // Click a spot on the unzoomed preview, make it the zoom's target, and
+    // look at the zoomed frame: that spot is now in the middle of the view.
+    show(&mut ed, 0.0);
+    let target = ed.zoom_target_at(egui::vec2(0.42, 0.47)).unwrap();
+    ed.edit(|p| p.timeline.zooms[0].mode = glide::project::model::ZoomMode::Manual { target });
+    let zoom = show(&mut ed, 3000.0);
+    assert!(zoom > 1.5);
+    let frame = ed.preview.last_frame.clone().unwrap();
+    let out = ed.preview.scene.screen_to_output(ed.preview.scene.sizes.crop.at(target), frame.window.rect);
+    let (x, y) = (out.x / frame.size.x, out.y / frame.size.y);
+    assert!((x - 0.5).abs() < 0.01 && (y - 0.5).abs() < 0.01, "drawn at ({x:.3}, {y:.3})");
+    let _ = std::fs::remove_dir_all(&dir);
+}
