@@ -61,6 +61,20 @@ fn mask_color() -> Color32 {
     Color32::from_rgb(0xec, 0x48, 0x99)
 }
 
+/// Which part of the block spanning `left..right` the pointer at `x` is on.
+/// The edge zones are `EDGE` wide but never more than a third of the block,
+/// so a short block keeps a body to grab.
+fn part_at(x: f32, left: f32, right: f32) -> Part {
+    let edge = EDGE.min((right - left) / 3.0);
+    if (x - left).abs() < edge {
+        Part::Left
+    } else if (x - right).abs() < edge {
+        Part::Right
+    } else {
+        Part::Body
+    }
+}
+
 /// `v.clamp(lo, hi)`, or `keep` when the range is empty (an item already
 /// shorter than the minimum length can't be resized further; `clamp` would
 /// panic).
@@ -159,6 +173,7 @@ pub fn ui(ui: &mut Ui, ed: &mut Editor) {
         }
 
         let pointer = ui.input(|i| i.pointer.interact_pos());
+        let press_origin = ui.input(|i| i.pointer.press_origin());
         let mut drag: Option<Drag> = ui.data(|d| d.get_temp(drag_id));
         let mut hover_cursor = None;
 
@@ -230,16 +245,14 @@ pub fn ui(ui: &mut Ui, ed: &mut Editor) {
             if r.width() > 40.0 {
                 painter.text(r.left_center() + vec2(8.0, 0.0), egui::Align2::LEFT_CENTER, format!("{:.1}× {mode}", z.scale), theme::semibold(11.0), Color32::WHITE);
             }
-            if let Some(pos) = pointer
+            // egui reports a drag only after the pointer has travelled a few
+            // pixels, so where it started decides which part was grabbed (by
+            // then the pointer has left a narrow edge zone).
+            let at = if bg.drag_started() { press_origin.or(pointer) } else { pointer };
+            if let Some(pos) = at
                 && r.expand(2.0).contains(pos)
             {
-                let part = if (pos.x - r.left()).abs() < EDGE {
-                    Part::Left
-                } else if (pos.x - r.right()).abs() < EDGE {
-                    Part::Right
-                } else {
-                    Part::Body
-                };
+                let part = part_at(pos.x, r.left(), r.right());
                 if part != Part::Body {
                     hover_cursor = Some(egui::CursorIcon::ResizeHorizontal);
                 }
@@ -262,10 +275,9 @@ pub fn ui(ui: &mut Ui, ed: &mut Editor) {
         {
             let src = map.to_source(pb_of(pos.x));
             let scale = ed.project.style.default_zoom;
-            let end_limit = ed.rec.meta.duration_ms;
+            let duration = ed.rec.meta.duration_ms;
             ed.edit(|p| {
-                let id = p.timeline.new_id();
-                p.timeline.zooms.push(Zoom { id, start: src, end: (src + 2500.0).min(end_limit), scale, ..Default::default() });
+                p.timeline.add_zoom(src, scale, duration);
             });
         }
 
@@ -453,15 +465,17 @@ pub fn ui(ui: &mut Ui, ed: &mut Editor) {
                     let delta = src - grab_src;
                     let mut draft = ed.project.clone();
                     if let Some(z) = draft.timeline.zooms.iter_mut().find(|z| z.id == id) {
-                        match part {
-                            Part::Body => {
-                                let len = orig.1 - orig.0;
-                                z.start = (orig.0 + delta).clamp(0.0, (dur_src - len).max(0.0));
-                                z.end = z.start + len;
-                            }
-                            Part::Left => z.start = clamp_or(orig.0 + delta, 0.0, orig.1 - Zoom::MIN_LEN_MS / 2.0, orig.0),
-                            Part::Right => z.end = clamp_or(orig.1 + delta, orig.0 + Zoom::MIN_LEN_MS / 2.0, dur_src, orig.1),
+                        if part != Part::Body {
+                            hover_cursor = Some(egui::CursorIcon::ResizeHorizontal);
                         }
+                        // Always resize from where the drag began, not from the last frame.
+                        let mut edited = Zoom { start: orig.0, end: orig.1, ..*z };
+                        match part {
+                            Part::Body => edited.move_to(orig.0 + delta, dur_src),
+                            Part::Left => edited.trim_start(orig.0 + delta),
+                            Part::Right => edited.trim_end(orig.1 + delta, dur_src),
+                        }
+                        (z.start, z.end) = (edited.start, edited.end);
                     }
                     ed.commit(draft);
                 }
@@ -540,6 +554,20 @@ mod tests {
     fn clamp_or_never_panics() {
         assert_eq!(super::clamp_or(5.0, 0.0, 3.0, 9.0), 3.0);
         assert_eq!(super::clamp_or(5.0, 4.0, 3.0, 9.0), 9.0);
+    }
+
+    #[test]
+    fn edge_zones_shrink_on_short_blocks_so_the_body_stays_grabbable() {
+        use super::Part::{Body, Left, Right};
+        // Wide block: the full 7 px at each edge.
+        assert!(matches!(super::part_at(103.0, 100.0, 300.0), Left));
+        assert!(matches!(super::part_at(297.0, 100.0, 300.0), Right));
+        assert!(matches!(super::part_at(200.0, 100.0, 300.0), Body));
+        assert!(matches!(super::part_at(108.0, 100.0, 300.0), Body));
+        // 12 px block: edge zones are 4 px, the middle is still the body.
+        assert!(matches!(super::part_at(103.0, 100.0, 112.0), Left));
+        assert!(matches!(super::part_at(106.0, 100.0, 112.0), Body));
+        assert!(matches!(super::part_at(109.0, 100.0, 112.0), Right));
     }
 
     #[test]

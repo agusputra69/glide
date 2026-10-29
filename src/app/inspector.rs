@@ -618,6 +618,7 @@ fn animation(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
 fn zoom_panel(ui: &mut Ui, ed: &mut Editor, d: &mut Project, id: u64) {
     let Some(z) = d.timeline.zooms.iter_mut().find(|z| z.id == id) else { return };
     let mut delete = false;
+    let mut split = false;
     section(ui, "Zoom", |ui| {
         slider(ui, "Zoom level", &mut z.scale, 1.0..=5.0, "×");
         let mut mode = match z.mode {
@@ -642,8 +643,14 @@ fn zoom_panel(ui: &mut Ui, ed: &mut Editor, d: &mut Project, id: u64) {
         toggle_row(ui, "Instant (no animation)", &mut z.instant);
         toggle_row(ui, "Disabled", &mut z.disabled);
         caption(ui, &format!("{} – {}", widgets::fmt_time(z.start), widgets::fmt_time(z.end)));
-        delete = ui.button("Delete zoom").clicked();
+        ui.horizontal(|ui| {
+            split = ui.button("Split at playhead").on_hover_text("Cut this zoom in two at the playhead (⇧S)").clicked();
+            delete = ui.button("Delete zoom").clicked();
+        });
     });
+    if split {
+        ed.split_zoom_in(d, id);
+    }
     if delete {
         d.timeline.zooms.retain(|z| z.id != id);
         ed.selection = Selection::None;

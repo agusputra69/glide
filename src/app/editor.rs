@@ -347,6 +347,28 @@ impl Editor {
         });
     }
 
+    /// Split zoom `id` of `p` at the playhead. Says why when it can't
+    /// (the playhead has to be at least the minimum zoom length inside it).
+    pub fn split_zoom_in(&mut self, p: &mut Project, id: u64) -> bool {
+        let src = self.source_at_playhead();
+        let split = p.timeline.split_zoom(id, src).is_some();
+        if !split {
+            self.status = Some(format!("Put the playhead at least {:.1} s inside the zoom to split it", Zoom::MIN_LEN_MS / 1000.0));
+        }
+        split
+    }
+
+    /// Split the selected zoom at the playhead (⇧S).
+    pub fn split_zoom(&mut self) {
+        if let Selection::Zoom(id) = self.selection {
+            let mut draft = self.project.clone();
+            if self.split_zoom_in(&mut draft, id) {
+                self.last_commit = None;
+                self.commit(draft);
+            }
+        }
+    }
+
     /// Cut a range where content under a mask moved out of the edit.
     pub fn cut_exposure(&mut self, e: crate::exposure::Exposure) {
         let duration = self.preview.scene.map.source_end();
@@ -395,15 +417,9 @@ impl Editor {
     /// Add a zoom at the playhead.
     pub fn add_zoom(&mut self) {
         let src = self.source_at_playhead();
-        let end_limit = self.rec.meta.duration_ms;
+        let duration = self.rec.meta.duration_ms;
         let mut new_id = 0;
-        self.edit(|p| {
-            let id = p.timeline.new_id();
-            new_id = id;
-            let start = src.max(0.0);
-            let end = (start + 2500.0).min(end_limit);
-            p.timeline.zooms.push(Zoom { id, start, end, scale: p.style.default_zoom, ..Default::default() });
-        });
+        self.edit(|p| new_id = p.timeline.add_zoom(src, p.style.default_zoom, duration));
         self.selection = Selection::Zoom(new_id);
     }
 
@@ -668,7 +684,7 @@ impl Editor {
         if cmd && pressed(egui::Key::Z) {
             if shift { self.redo() } else { self.undo() }
         } else if pressed(egui::Key::S) && !cmd {
-            self.split();
+            if shift { self.split_zoom() } else { self.split() }
         } else if pressed(egui::Key::Z) && !cmd {
             self.add_zoom();
         }
