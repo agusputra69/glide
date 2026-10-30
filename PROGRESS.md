@@ -67,7 +67,7 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 
 `scripts/selftest.sh --screen` (2026-10-12): 13/13 pass.
 
-- `cargo test` (92): engine, project, presets, renderer helpers, masks,
+- `cargo test` (124): engine, project, presets, renderer helpers, masks,
   device frames, typing detection, caption editing, transcription chunking,
   Whisper transcription of synthesized speech,
   hotkeys, timeline clamping and cuts, voice isolation, masked-content
@@ -77,7 +77,8 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
   pixels back and compare them (and the exported frame) before and after,
   and audio tests (track levels and the silence note, the playback mix
   following mutes while open, the exported MP4 carrying the tone, tone
-  detection under louder sound).
+  detection under louder sound), a snapshot render, timeline pointer drags
+  and unreadable-project errors.
 - Synthetic package → MP4 and GIF.
 - Background check (`glide check-background`): 22 edits (each wallpaper,
   blur on and off, gradient, its angle and colours, two colours, an image,
