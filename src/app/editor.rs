@@ -579,8 +579,8 @@ impl Editor {
         self.export.running.is_some()
     }
     /// Stop a running export and wait for its thread, which removes its temp
-    /// file. A cancelled run leaves nothing at the output path and shows no result. A run that
-    /// had already finished keeps its file and its result.
+    /// file. A cancelled run leaves nothing at the output path and shows no
+    /// result. A run that had already finished keeps its file and its result.
     pub fn cancel_export(&mut self) {
         if let Some(mut run) = self.export.running.take() {
             run.cancel.store(true, Ordering::SeqCst);
