@@ -1835,7 +1835,7 @@ impl App {
         let renderer = &mut win.renderer;
         // The overlay may close itself while drawing; remember that.
         let mut keep = true;
-        let out = ctx.run_ui(input, |ui| match which {
+        let mut out = ctx.run_ui(input, |ui| match which {
             Which::Main => self.draw_main(ui, renderer),
             Which::Overlay(display) => {
                 egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
@@ -1904,6 +1904,8 @@ impl App {
         for id in &out.textures_delta.free {
             win.renderer.free_texture(id);
         }
+        // Applied above. egui debug-asserts when a frame drops its texture deltas.
+        out.textures_delta.clear();
         if DRAG.swap(false, Ordering::Relaxed) {
             let _ = win.window.drag_window();
         }
