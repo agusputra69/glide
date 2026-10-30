@@ -133,11 +133,14 @@ struct Slot<K, V> {
     /// The last failure text printed, so a retry that fails the same way
     /// again isn't printed again.
     logged: Option<String>,
+    /// Threads still dropping stopped values (stopping a capture session
+    /// takes a moment, so it isn't done on the UI thread).
+    dropping: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl<K, V> Default for Slot<K, V> {
     fn default() -> Self {
-        Slot { want: None, want_since: None, running: None, starting: None, failed: None, failed_at: None, logged: None }
+        Slot { want: None, want_since: None, running: None, starting: None, failed: None, failed_at: None, logged: None, dropping: vec![] }
     }
 }
 
@@ -153,7 +156,7 @@ impl<K: Clone + PartialEq + Send + 'static, V: Send + 'static> Slot<K, V> {
         }
         if self.running.as_ref().is_some_and(|(k, _)| Some(k) != want.as_ref()) {
             let (_, v) = self.running.take().unwrap();
-            std::thread::spawn(move || drop(v));
+            self.drop_later(v);
             stopped = true;
         }
         if let Some((k, rx)) = &self.starting
@@ -166,7 +169,7 @@ impl<K: Clone + PartialEq + Send + 'static, V: Send + 'static> Slot<K, V> {
                     self.logged = None;
                     self.running = Some((k, v));
                 }
-                Ok(v) => drop(std::thread::spawn(move || drop(v))),
+                Ok(v) => self.drop_later(v),
                 Err(e) => self.fail(k, name, e),
             }
         }
@@ -209,9 +212,33 @@ impl<K: Clone + PartialEq + Send + 'static, V: Send + 'static> Slot<K, V> {
     /// something was running, whose output is then stale.
     fn fail_running(&mut self, name: &str, msg: String) -> bool {
         let Some((k, v)) = self.running.take() else { return false };
-        std::thread::spawn(move || drop(v));
+        self.drop_later(v);
         self.fail(k, name, msg);
         true
+    }
+
+    /// Drop `v` on a thread of its own, remembered so `stop_and_join` can
+    /// wait for it.
+    fn drop_later(&mut self, v: V) {
+        self.dropping.retain(|h| !h.is_finished());
+        self.dropping.push(std::thread::spawn(move || drop(v)));
+    }
+
+    /// Stop everything now, on this thread, and return only when it has
+    /// stopped: the running value is dropped here, a value still starting is
+    /// waited for (up to 3 s) and dropped, and earlier background drops are
+    /// joined. For a single-client device that must be free before something
+    /// else opens it.
+    fn stop_and_join(&mut self) {
+        drop(self.running.take());
+        if let Some((_, rx)) = self.starting.take() {
+            drop(rx.recv_timeout(Duration::from_secs(3)));
+        }
+        for h in self.dropping.drain(..) {
+            let _ = h.join();
+        }
+        self.want = None;
+        self.reset_failed();
     }
 
     /// Forget a failure so the wanted key starts again on the next `update`.
@@ -738,6 +765,12 @@ impl App {
 
     fn begin_capture(&mut self) {
         let opts = self.recorder_options();
+        // An iPhone's screen has one client at a time: let the preview's
+        // session finish stopping before the recorder opens the device.
+        if matches!(opts.target, Target::Device { .. }) {
+            self.live.screen.stop_and_join();
+            self.live.tex = None;
+        }
         match Recorder::start(opts) {
             Ok(r) => {
                 if let Some(rec) = &mut self.recording {
@@ -2365,6 +2398,63 @@ mod tests {
         let later = slot.failed_at.unwrap() + Duration::from_secs(3);
         assert!(slot.retry_failed(later, IOS_RETRY));
         pump(&mut slot, Some(1), starts_fine, |s| s.running.is_some());
+    }
+
+    /// A value whose drop takes 100 ms and then sets a flag.
+    struct SlowDrop(&'static std::sync::atomic::AtomicBool);
+    impl Drop for SlowDrop {
+        fn drop(&mut self) {
+            std::thread::sleep(Duration::from_millis(100));
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    static JOIN_DROPPED: AtomicBool = AtomicBool::new(false);
+    #[test]
+    fn slot_stop_and_join_waits_for_a_drop_already_running_in_the_background() {
+        let mut slot: Slot<u8, SlowDrop> = Slot::default();
+        slot.update(Some(1), "test", |_| Ok(SlowDrop(&JOIN_DROPPED)));
+        slot.want_since = Some(Instant::now() - Duration::from_secs(1));
+        for _ in 0..400 {
+            slot.update(Some(1), "test", |_| Ok(SlowDrop(&JOIN_DROPPED)));
+            if slot.running.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(slot.running.is_some());
+        // Nothing wanted: the value is handed to a background thread.
+        slot.update(None, "test", |_| Ok(SlowDrop(&JOIN_DROPPED)));
+        assert!(slot.running.is_none());
+        assert!(!JOIN_DROPPED.load(Ordering::SeqCst), "the drop should still be running");
+        slot.stop_and_join();
+        assert!(JOIN_DROPPED.load(Ordering::SeqCst));
+        assert!(slot.dropping.is_empty());
+    }
+
+    static STARTING_DROPPED: AtomicBool = AtomicBool::new(false);
+    #[test]
+    fn slot_stop_and_join_waits_for_a_value_that_is_still_starting() {
+        let mut slot: Slot<u8, SlowDrop> = Slot::default();
+        let start: fn(&u8) -> Result<SlowDrop, String> = |_| {
+            std::thread::sleep(Duration::from_millis(100));
+            Ok(SlowDrop(&STARTING_DROPPED))
+        };
+        slot.update(Some(1), "test", start);
+        slot.want_since = Some(Instant::now() - Duration::from_secs(1));
+        slot.update(Some(1), "test", start);
+        assert!(slot.starting.is_some());
+        slot.stop_and_join();
+        assert!(slot.running.is_none() && slot.starting.is_none() && slot.want.is_none());
+        assert!(STARTING_DROPPED.load(Ordering::SeqCst), "the late value should be dropped before returning");
+    }
+
+    #[test]
+    fn slot_stop_and_join_on_an_idle_slot_returns_at_once() {
+        let mut slot = TestSlot::default();
+        let t = Instant::now();
+        slot.stop_and_join();
+        assert!(t.elapsed() < Duration::from_millis(50));
     }
 
     #[test]
