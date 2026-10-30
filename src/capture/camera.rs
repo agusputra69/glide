@@ -1,6 +1,7 @@
 //! Webcam capture (AVCaptureSession) and device enumeration.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use objc2::rc::Retained;
@@ -83,22 +84,99 @@ pub fn enable_screen_capture_devices() {
         unsafe {
             CMIOObjectSetPropertyData(1, &address, 0, std::ptr::null(), 4, &allow as *const u32 as *const std::ffi::c_void);
         }
+        // The system only starts announcing screens after a discovery query
+        // has run once; this one's result is dropped.
+        let _ = ios_query();
     });
+}
+
+/// One muxed-device discovery, without the opt-in (which calls this).
+fn ios_query() -> Vec<Retained<AVCaptureDevice>> {
+    unsafe { discover(&[AVCaptureDeviceTypeExternal], AVMediaTypeMuxed.unwrap()) }
 }
 
 fn ios_raw() -> Vec<Retained<AVCaptureDevice>> {
     enable_screen_capture_devices();
-    unsafe { discover(&[AVCaptureDeviceTypeExternal], AVMediaTypeMuxed.unwrap()) }
+    ios_query()
 }
 
-/// Connected iPhones/iPads whose screens can be recorded.
+/// How long an iPhone/iPad lookup waits for the device to show up, and the
+/// pause between tries. The opt-in is asynchronous: the screen appears a
+/// moment after it, not before the first query returns.
+pub const IOS_WAIT: Duration = Duration::from_secs(3);
+pub const IOS_POLL: Duration = Duration::from_millis(150);
+
+/// Try `probe`, then retry after each `step` pause until it returns a value
+/// or the pauses add up past `deadline`. Returns the value, the number of
+/// tries and the time spent in pauses. `sleep` does the pausing, so tests
+/// need no clock.
+pub fn poll_until<T>(
+    deadline: Duration,
+    step: Duration,
+    mut probe: impl FnMut() -> Option<T>,
+    mut sleep: impl FnMut(Duration),
+) -> (Option<T>, u32, Duration) {
+    let (mut tries, mut waited) = (0u32, Duration::ZERO);
+    loop {
+        tries += 1;
+        if let Some(v) = probe() {
+            return (Some(v), tries, waited);
+        }
+        if step.is_zero() || waited + step > deadline {
+            return (None, tries, waited);
+        }
+        sleep(step);
+        waited += step;
+    }
+}
+
+fn names(list: &[Device]) -> String {
+    list.iter().map(|d| format!("{} ({})", d.name, d.id)).collect::<Vec<_>>().join(", ")
+}
+
+/// The iOS device `id`, waiting up to `IOS_WAIT` for it to be discovered.
+fn wait_ios(id: &str) -> Option<Retained<AVCaptureDevice>> {
+    let started = Instant::now();
+    let mut last = vec![];
+    let (found, tries, _) = poll_until(
+        IOS_WAIT,
+        IOS_POLL,
+        || {
+            let all = ios_raw();
+            let hit = all.iter().find(|d| unsafe { d.uniqueID().to_string() } == id).cloned();
+            if hit.is_none() {
+                last = all.iter().map(|d| describe(d)).collect();
+            }
+            hit
+        },
+        std::thread::sleep,
+    );
+    let ms = started.elapsed().as_millis();
+    match &found {
+        Some(_) => eprintln!("glide: ios discovery: {id} found after {tries} tries ({ms} ms)"),
+        None => eprintln!("glide: ios discovery: {id} not found after {tries} tries ({ms} ms); listed: [{}]", names(&last)),
+    }
+    found
+}
+
+/// Connected iPhones/iPads whose screens can be recorded (one query, no waiting).
 pub fn ios_devices() -> Vec<Device> {
     ios_raw().iter().map(|d| describe(d)).collect()
 }
 
+/// Like `ios_devices`, but while the list is empty keeps asking for up to
+/// `deadline`. For the command line; never call it on the UI thread.
+pub fn ios_devices_waiting(deadline: Duration) -> Vec<Device> {
+    let started = Instant::now();
+    let (list, tries, _) = poll_until(deadline, IOS_POLL, || Some(ios_devices()).filter(|l| !l.is_empty()), std::thread::sleep);
+    let list = list.unwrap_or_default();
+    eprintln!("glide: ios discovery: {} listed after {tries} tries ({} ms): [{}]", list.len(), started.elapsed().as_millis(), names(&list));
+    list
+}
+
 /// An iOS device's current screen size in pixels.
 pub fn ios_dimensions(id: &str) -> Option<(u32, u32)> {
-    let dev = ios_raw().into_iter().find(|d| unsafe { d.uniqueID().to_string() } == id)?;
+    let dev = wait_ios(id)?;
     unsafe {
         let desc = dev.activeFormat().formatDescription();
         let dims = objc2_core_media::CMVideoFormatDescriptionGetDimensions(&desc);
@@ -223,10 +301,7 @@ pub fn find_camera(sel: Option<&str>) -> Result<Retained<AVCaptureDevice>> {
 
 /// A connected iPhone/iPad by unique id.
 pub fn find_ios(id: &str) -> Result<Retained<AVCaptureDevice>> {
-    ios_raw()
-        .into_iter()
-        .find(|d| unsafe { d.uniqueID().to_string() } == id)
-        .ok_or_else(|| anyhow!("the iPhone/iPad is no longer connected"))
+    wait_ios(id).ok_or_else(|| anyhow!("the iPhone/iPad is no longer connected"))
 }
 
 pub struct CamIvars {
@@ -410,5 +485,63 @@ impl Mic {
 
     pub fn stop(&self) {
         unsafe { self.session.stopRunning() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A probe that succeeds on its `n`th call, recording the pauses asked for.
+    fn run(n: u32, deadline: Duration) -> (Option<u32>, u32, Duration, Vec<Duration>) {
+        let (mut calls, mut slept) = (0, vec![]);
+        let (v, tries, waited) = poll_until(
+            deadline,
+            Duration::from_millis(150),
+            || {
+                calls += 1;
+                (calls == n).then_some(calls)
+            },
+            |d| slept.push(d),
+        );
+        (v, tries, waited, slept)
+    }
+
+    #[test]
+    fn poll_until_finds_the_device_on_the_fourth_try() {
+        let (v, tries, waited, slept) = run(4, IOS_WAIT);
+        assert_eq!(v, Some(4));
+        assert_eq!(tries, 4);
+        assert_eq!(waited, Duration::from_millis(450));
+        assert_eq!(slept, vec![Duration::from_millis(150); 3]);
+    }
+
+    #[test]
+    fn poll_until_gives_up_after_the_deadline() {
+        let (v, tries, waited, slept) = run(u32::MAX, IOS_WAIT);
+        assert_eq!(v, None);
+        assert_eq!(tries, 21);
+        assert_eq!(waited, IOS_WAIT);
+        assert_eq!(slept.len(), 20);
+    }
+
+    #[test]
+    fn poll_until_does_not_sleep_when_the_first_try_succeeds() {
+        let (v, tries, waited, slept) = run(1, IOS_WAIT);
+        assert_eq!((v, tries, waited), (Some(1), 1, Duration::ZERO));
+        assert!(slept.is_empty());
+    }
+
+    #[test]
+    fn poll_until_tries_once_when_the_deadline_is_shorter_than_a_step() {
+        let (v, tries, _, slept) = run(u32::MAX, Duration::from_millis(100));
+        assert_eq!((v, tries), (None, 1));
+        assert!(slept.is_empty());
+    }
+
+    #[test]
+    fn poll_until_with_a_zero_step_does_not_loop() {
+        let (v, tries, _) = poll_until(IOS_WAIT, Duration::ZERO, || None::<u8>, |_| {});
+        assert_eq!((v, tries), (None, 1));
     }
 }

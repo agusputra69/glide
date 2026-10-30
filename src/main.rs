@@ -640,11 +640,14 @@ fn record(
         Target::Pattern
     } else if let Some(id) = device {
         glide::capture::camera::enable_screen_capture_devices();
-        std::thread::sleep(std::time::Duration::from_millis(1500));
-        let found = glide::capture::camera::ios_devices();
+        let wanted = id.to_lowercase();
+        let (found, ..) = glide::capture::camera::poll_until(
+            glide::capture::camera::IOS_WAIT,
+            glide::capture::camera::IOS_POLL,
+            || glide::capture::camera::ios_devices().into_iter().find(|d| d.id == id || d.name.to_lowercase().contains(&wanted)),
+            std::thread::sleep,
+        );
         let d = found
-            .iter()
-            .find(|d| d.id == id || d.name.to_lowercase().contains(&id.to_lowercase()))
             .ok_or_else(|| anyhow::anyhow!("no iPhone/iPad matches {id:?} (see `glide devices`)"))?;
         Target::Device { id: d.id.clone() }
     } else if let Some(id) = window {
@@ -727,9 +730,8 @@ fn devices() -> Result<()> {
     }
     // iOS devices appear shortly after screen-capture devices are enabled.
     camera::enable_screen_capture_devices();
-    std::thread::sleep(std::time::Duration::from_millis(1500));
     println!("iPhone / iPad:");
-    for d in camera::ios_devices() {
+    for d in camera::ios_devices_waiting(camera::IOS_WAIT) {
         println!("  {}  ({})", d.name, d.id);
     }
     Ok(())
