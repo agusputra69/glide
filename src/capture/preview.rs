@@ -254,7 +254,11 @@ impl LivePreview {
     pub fn start(source: &Source, max_px: u32, fps: u32, audio: bool, on_frame: impl Fn() + Send + Sync + 'static) -> Result<LivePreview> {
         match source {
             Source::Camera { id } => return Self::start_camera(camera::find_camera(id.as_deref())?, max_px, false, on_frame),
-            Source::Device { id } => return Self::start_camera(camera::find_ios(id)?, max_px, true, on_frame),
+            Source::Device { id } => {
+                // The one place that may ask, on the Slot's background thread.
+                super::tcc::require_camera(std::time::Duration::from_secs(60))?;
+                return Self::start_camera(camera::find_ios(id)?, max_px, true, on_frame);
+            }
             _ => {}
         }
         let displays = screen::displays()?;

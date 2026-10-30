@@ -200,6 +200,7 @@ impl Recorder {
         let (cap_target, kind, bounds, size, window, app_name) = match &opts.target {
             Target::Pattern => (None, SourceKind::Display, Rect::new(0.0, 0.0, 1440.0, 900.0), (2880, 1800), None, None),
             Target::Device { id } => {
+                crate::capture::tcc::check_camera_now()?;
                 let (w, h) = crate::capture::camera::ios_dimensions(id).context("iPhone/iPad not found — connect it with a cable and unlock it")?;
                 let px = (even(w as f64), even(h as f64));
                 (None, SourceKind::Device, Rect::new(0.0, 0.0, px.0 as f64, px.1 as f64), px, None, None)
