@@ -599,6 +599,11 @@ impl Default for LayoutRange {
         LayoutRange { id: 0, start: 0.0, end: 0.0, kind: LayoutKind::Both, camera_size: None, camera_position: None }
     }
 }
+impl LayoutRange {
+    /// Length of a layout added at the playhead.
+    pub const DEFAULT_LEN_MS: f64 = 3000.0;
+    pub const MIN_LEN_MS: f64 = 300.0;
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -639,6 +644,8 @@ impl Mask {
     /// Fade in/out time at the ends of the range.
     pub const FADE_MS: f64 = 150.0;
     pub const MIN_LEN_MS: f64 = 300.0;
+    /// Length of a mask added at the playhead.
+    pub const DEFAULT_LEN_MS: f64 = 3000.0;
 
     pub fn default_amount(kind: MaskKind) -> f64 {
         match kind {
@@ -682,6 +689,15 @@ impl Default for VoiceOver {
     }
 }
 
+/// Where a `len` ms range added at `at` goes in a `duration` ms recording:
+/// inside it, and at least `min` long (it starts earlier when `at` is too
+/// close to the end). A recording shorter than `len` gets all of it.
+pub fn span_at(at: f64, len: f64, min: f64, duration: f64) -> (f64, f64) {
+    let duration = duration.max(0.0);
+    let (len, min) = (len.min(duration), min.min(duration));
+    let start = at.clamp(0.0, (duration - min).max(0.0));
+    (start, (start + len).min(duration))
+}
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Timeline {
@@ -704,12 +720,24 @@ impl Timeline {
     /// `Zoom::MIN_LEN_MS` (it starts earlier when `at` is too close to the end).
     pub fn add_zoom(&mut self, at: f64, scale: f64, duration: f64) -> u64 {
         let id = self.new_id();
-        let start = at.clamp(0.0, (duration - Zoom::MIN_LEN_MS).max(0.0));
-        let end = (start + Zoom::DEFAULT_LEN_MS).min(duration).max(start);
+        let (start, end) = span_at(at, Zoom::DEFAULT_LEN_MS, Zoom::MIN_LEN_MS, duration);
         self.zooms.push(Zoom { id, start, end, scale, ..Default::default() });
         id
     }
-
+    /// Add a mask at source time `at`, placed like `add_zoom`.
+    pub fn add_mask(&mut self, at: f64, duration: f64) -> u64 {
+        let id = self.new_id();
+        let (start, end) = span_at(at, Mask::DEFAULT_LEN_MS, Mask::MIN_LEN_MS, duration);
+        self.masks.push(Mask { id, start, end, ..Default::default() });
+        id
+    }
+    /// Add a camera-only layout at source time `at`, placed like `add_zoom`.
+    pub fn add_layout(&mut self, at: f64, duration: f64) -> u64 {
+        let id = self.new_id();
+        let (start, end) = span_at(at, LayoutRange::DEFAULT_LEN_MS, LayoutRange::MIN_LEN_MS, duration);
+        self.layouts.push(LayoutRange { id, start, end, kind: LayoutKind::CameraOnly, ..Default::default() });
+        id
+    }
     /// Split zoom `id` at source time `t` into two that share its settings.
     /// Each half keeps at least `Zoom::MIN_LEN_MS`. Returns the id of the new
     /// second half, or None when `t` is too close to an end (or no such zoom).
@@ -1032,6 +1060,45 @@ mod tests {
         assert_eq!(z.start, 0.0);
     }
 
+    #[test]
+    fn span_at_start_of_the_recording() {
+        assert_eq!(span_at(0.0, 3000.0, 300.0, 10_000.0), (0.0, 3000.0));
+    }
+    #[test]
+    fn span_at_the_middle() {
+        assert_eq!(span_at(4000.0, 3000.0, 300.0, 10_000.0), (4000.0, 7000.0));
+    }
+    #[test]
+    fn span_at_exactly_the_end() {
+        assert_eq!(span_at(10_000.0, 3000.0, 300.0, 10_000.0), (9700.0, 10_000.0));
+    }
+    #[test]
+    fn span_past_the_end_is_pulled_back() {
+        assert_eq!(span_at(15_000.0, 3000.0, 300.0, 10_000.0), (9700.0, 10_000.0));
+    }
+    #[test]
+    fn span_before_the_start_is_pushed_forward() {
+        assert_eq!(span_at(-50.0, 3000.0, 300.0, 10_000.0), (0.0, 3000.0));
+    }
+    #[test]
+    fn a_recording_shorter_than_the_default_length_gets_the_whole_recording() {
+        assert_eq!(span_at(0.0, 3000.0, 300.0, 1000.0), (0.0, 1000.0));
+        assert_eq!(span_at(100.0, 3000.0, 300.0, 200.0), (0.0, 200.0));
+    }
+    #[test]
+    fn added_masks_and_layouts_are_never_zero_length_at_the_end() {
+        let mut tl = Timeline::default();
+        let m = tl.add_mask(10_000.0, 10_000.0);
+        let l = tl.add_layout(15_000.0, 10_000.0);
+        let mask = *tl.masks.iter().find(|x| x.id == m).unwrap();
+        let layout = *tl.layouts.iter().find(|x| x.id == l).unwrap();
+        assert_eq!((mask.start, mask.end), (10_000.0 - Mask::MIN_LEN_MS, 10_000.0));
+        assert_eq!((layout.start, layout.end), (10_000.0 - LayoutRange::MIN_LEN_MS, 10_000.0));
+        assert_eq!(layout.kind, LayoutKind::CameraOnly);
+        let m = tl.add_mask(2000.0, 10_000.0);
+        let mask = *tl.masks.iter().find(|x| x.id == m).unwrap();
+        assert_eq!((mask.start, mask.end), (2000.0, 5000.0));
+    }
     #[test]
     fn added_zooms_never_run_past_the_end_or_below_the_minimum() {
         let mut tl = Timeline::default();

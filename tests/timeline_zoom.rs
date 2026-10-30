@@ -5,7 +5,7 @@
 use egui::{Color32, Event, PointerButton, Pos2, Rect, Shape, vec2};
 use glide::app::editor::{Editor, Selection};
 use glide::app::home::{self, Devices, Settings, Thumbs};
-use glide::project::model::Zoom;
+use glide::project::model::{Mask, Zoom};
 use glide::render::Gpu;
 
 /// Zoom blocks are drawn with this fill (70 % unselected, 95 % selected).
@@ -263,5 +263,16 @@ fn holding_a_clip_edge_keeps_the_trim_where_the_pointer_is() {
     let expected = 100.0 / ed.px_per_sec as f64 * 1000.0;
     assert!((s.start - expected).abs() < 5.0, "start {} ms, expected about {expected} ms", s.start);
     assert_eq!(s.end, slice.end, "the end must not move: {s:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+#[test]
+fn a_mask_added_at_the_end_is_visible() {
+    let gpu = Gpu::headless().unwrap();
+    let (mut ed, dir, _) = editor_with_zoom("mask-end", gpu);
+    let duration = ed.rec.meta.duration_ms;
+    ed.seek(ed.duration());
+    ed.add_mask();
+    let m = ed.project.timeline.masks.last().unwrap();
+    assert!(m.end <= duration && m.end - m.start >= Mask::MIN_LEN_MS, "{m:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }

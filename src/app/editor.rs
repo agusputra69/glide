@@ -476,15 +476,9 @@ impl Editor {
     /// Add a blur mask at the playhead.
     pub fn add_mask(&mut self) {
         let src = self.source_at_playhead();
-        let end_limit = self.rec.meta.duration_ms;
+        let duration = self.rec.meta.duration_ms;
         let mut new_id = 0;
-        self.edit(|p| {
-            let id = p.timeline.new_id();
-            new_id = id;
-            let start = src.max(0.0);
-            let end = (start + 3000.0).min(end_limit);
-            p.timeline.masks.push(crate::project::model::Mask { id, start, end, ..Default::default() });
-        });
+        self.edit(|p| new_id = p.timeline.add_mask(src, duration));
         self.selection = Selection::Mask(new_id);
     }
 
@@ -969,16 +963,9 @@ impl Editor {
             }
             if self.rec.meta.camera.is_some() && ui.button("+ Layout").clicked() {
                 let src = self.source_at_playhead();
-                let dur_src = self.rec.meta.duration_ms;
+                let duration = self.rec.meta.duration_ms;
                 self.edit(|p| {
-                    let id = p.timeline.new_id();
-                    p.timeline.layouts.push(crate::project::model::LayoutRange {
-                        id,
-                        start: src,
-                        end: (src + 3000.0).min(dur_src).max(src),
-                        kind: crate::project::model::LayoutKind::CameraOnly,
-                        ..Default::default()
-                    });
+                    p.timeline.add_layout(src, duration);
                 });
             }
             if ui.add_enabled(self.selection != Selection::None, egui::Button::new("Delete")).clicked() {

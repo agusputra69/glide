@@ -6,7 +6,7 @@ use egui::{Color32, CornerRadius, Pos2, Rect, RichText, Sense, Stroke, Ui, pos2,
 
 use super::editor::{Editor, Selection};
 use super::theme::{self, pal};
-use crate::project::model::{LayoutKind, Mask, MaskKind, Zoom, ZoomMode};
+use crate::project::model::{LayoutKind, LayoutRange, Mask, MaskKind, Zoom, ZoomMode};
 
 const RULER_H: f32 = 18.0;
 const TRACK_H: f32 = 40.0;
@@ -387,13 +387,9 @@ pub fn ui(ui: &mut Ui, ed: &mut Editor) {
             })
         {
             let src = map.to_source(pb_of(pos.x));
-            let end_limit = ed.rec.meta.duration_ms;
+            let duration = ed.rec.meta.duration_ms;
             let mut new_id = 0;
-            ed.edit(|p| {
-                let id = p.timeline.new_id();
-                new_id = id;
-                p.timeline.masks.push(Mask { id, start: src, end: (src + 3000.0).min(end_limit), ..Default::default() });
-            });
+            ed.edit(|p| new_id = p.timeline.add_mask(src, duration));
             ed.selection = Selection::Mask(new_id);
         }
 
@@ -522,8 +518,8 @@ pub fn ui(ui: &mut Ui, ed: &mut Editor) {
                                 l.start = (orig.0 + delta).clamp(0.0, (dur_src - len).max(0.0));
                                 l.end = l.start + len;
                             }
-                            Part::Left => l.start = clamp_or(orig.0 + delta, 0.0, orig.1 - 300.0, orig.0),
-                            Part::Right => l.end = clamp_or(orig.1 + delta, orig.0 + 300.0, dur_src, orig.1),
+                            Part::Left => l.start = clamp_or(orig.0 + delta, 0.0, orig.1 - LayoutRange::MIN_LEN_MS, orig.0),
+                            Part::Right => l.end = clamp_or(orig.1 + delta, orig.0 + LayoutRange::MIN_LEN_MS, dur_src, orig.1),
                         }
                     }
                     ed.commit(draft);
