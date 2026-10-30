@@ -300,6 +300,13 @@ impl Editor {
         self.dirty_at = None;
     }
 
+    /// Write edits that autosave has not reached yet.
+    pub fn flush(&mut self) {
+        if self.dirty_at.is_some() {
+            self.save();
+        }
+    }
+
     pub fn toggle_play(&mut self) {
         // Pausing while narrating ends the voice-over instead of letting the
         // narration drift from the picture.

@@ -39,7 +39,7 @@ use crate::recorder::{self, Recorder, Target};
 use crate::render::Gpu;
 use editor::Editor;
 use home::{Devices, Settings, SourceKind, Thumbs};
-use lifecycle::{ExportGuard, Leaving};
+use lifecycle::{ExportGuard, Leaving, Switch};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Cmd {
@@ -547,18 +547,42 @@ impl App {
         }
         true
     }
-    fn open_project(&mut self, el: &ActiveEventLoop, path: PathBuf) {
+    /// Show `path` in the editor. Returns whether that project is now open.
+    /// The running export is cancelled only once the new editor is ready.
+    fn open_project(&mut self, el: &ActiveEventLoop, path: PathBuf, why: Leaving) -> bool {
         self.show_main(el);
-        let Some(gpu) = self.gpu.clone() else { return };
-        match Editor::open(&path, gpu) {
-            Ok(ed) => {
+        let Some(gpu) = self.gpu.clone() else { return false };
+        let scripted = self.scripted();
+        let (current, same) = match &mut self.view {
+            View::Editor(ed) => {
+                let same = lifecycle::same_project(&ed.package.root, &path);
+                (Some(&mut **ed), same)
+            }
+            View::Start => (None, false),
+        };
+        let ask = |prompt| rfd::MessageDialog::new().set_title("Glide").set_description(prompt).set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes;
+        match lifecycle::switch_to(current, same, scripted, why, || Editor::open(&path, gpu), ask) {
+            Switch::Same => true,
+            Switch::Opened(ed) => {
                 if let Some(w) = &self.main {
                     w.window.set_title(&ed.project.name);
                 }
                 self.release_editor_texture();
                 self.view = View::Editor(Box::new(ed));
+                true
             }
-            Err(e) => self.error = Some(format!("Couldn't open {}: {e:#}", path.display())),
+            Switch::Declined => {
+                if why == Leaving::OpenRecording
+                    && let View::Editor(ed) = &mut self.view
+                {
+                    ed.status = Some("Your recording is saved. Open it from Recent once the export is done.".into());
+                }
+                false
+            }
+            Switch::Failed(e) => {
+                self.error = Some(format!("Couldn't open {}: {e:#}", path.display()));
+                false
+            }
         }
     }
 
@@ -748,9 +772,7 @@ impl App {
             Cmd::CheckForUpdates => updater::check_for_updates(),
             Cmd::Back => self.close_project(),
             Cmd::Open(p) => {
-                if self.confirm_leaving(Leaving::OpenProject) {
-                    self.open_project(el, p);
-                }
+                self.open_project(el, p, Leaving::OpenProject);
             }
             Cmd::RecordSource(kind) => {
                 if self.recording.is_some() {
@@ -836,8 +858,9 @@ impl App {
             match res {
                 Ok(path) => {
                     self.projects = home::scan_projects(&self.settings.dir());
-                    self.open_project(el, path);
-                    if let View::Editor(ed) = &mut self.view {
+                    if self.open_project(el, path, Leaving::OpenRecording)
+                        && let View::Editor(ed) = &mut self.view
+                    {
                         ed.fresh = true;
                     }
                 }
@@ -1956,7 +1979,7 @@ impl ApplicationHandler for App {
         self.bind_hotkeys();
         self.show_main(el);
         if let Some(p) = self.open_at_launch.take() {
-            self.open_project(el, p);
+            self.open_project(el, p, Leaving::OpenProject);
         }
         if !self.scripted() {
             push(Cmd::StartUpdater);
