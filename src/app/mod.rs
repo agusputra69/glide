@@ -8,6 +8,7 @@ pub mod maskwatch;
 pub mod home;
 pub mod hotkey;
 pub mod inspector;
+pub mod lifecycle;
 pub mod macos;
 pub mod menubar;
 pub mod player;
@@ -38,6 +39,7 @@ use crate::recorder::{self, Recorder, Target};
 use crate::render::Gpu;
 use editor::Editor;
 use home::{Devices, Settings, SourceKind, Thumbs};
+use lifecycle::{ExportGuard, Leaving};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Cmd {
@@ -526,6 +528,25 @@ impl App {
         }
     }
 
+    /// Before the editor goes away: if it is exporting, ask whether to cancel
+    /// the export (scripted runs just cancel). False means stay where we are.
+    fn confirm_leaving(&mut self, leaving: Leaving) -> bool {
+        let running = matches!(&self.view, View::Editor(ed) if ed.export_running());
+        match lifecycle::export_guard(running, self.scripted(), leaving) {
+            ExportGuard::Proceed => return true,
+            ExportGuard::ProceedCancelling => {}
+            ExportGuard::Ask { prompt } => {
+                let answer = rfd::MessageDialog::new().set_title("Glide").set_description(prompt).set_buttons(rfd::MessageButtons::YesNo).show();
+                if answer != rfd::MessageDialogResult::Yes {
+                    return false;
+                }
+            }
+        }
+        if let View::Editor(ed) = &mut self.view {
+            ed.cancel_export();
+        }
+        true
+    }
     fn open_project(&mut self, el: &ActiveEventLoop, path: PathBuf) {
         self.show_main(el);
         let Some(gpu) = self.gpu.clone() else { return };
@@ -726,7 +747,11 @@ impl App {
             Cmd::StartUpdater => updater::start(),
             Cmd::CheckForUpdates => updater::check_for_updates(),
             Cmd::Back => self.close_project(),
-            Cmd::Open(p) => self.open_project(el, p),
+            Cmd::Open(p) => {
+                if self.confirm_leaving(Leaving::OpenProject) {
+                    self.open_project(el, p);
+                }
+            }
             Cmd::RecordSource(kind) => {
                 if self.recording.is_some() {
                     return;
@@ -769,6 +794,9 @@ impl App {
                 self.open_overlays(el, id);
             }
             Cmd::Quit => {
+                if !self.confirm_leaving(Leaving::Quit) {
+                    return;
+                }
                 if let View::Editor(ed) = &mut self.view {
                     ed.save();
                 }
@@ -1447,6 +1475,9 @@ impl App {
 
     /// Close the open recording (it saves) and show recording setup.
     fn close_project(&mut self) {
+        if !self.confirm_leaving(Leaving::CloseProject) {
+            return;
+        }
         if let View::Editor(ed) = &mut self.view {
             ed.save();
             // Its thumbnail re-renders if the project changed.
@@ -2004,6 +2035,7 @@ impl ApplicationHandler for App {
             if ed.voice.is_some() {
                 ed.stop_voiceover();
             }
+            ed.cancel_export();
             ed.save();
         }
         if let Some(Recording { rec: Some(r), .. }) = self.recording.take() {

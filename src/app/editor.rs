@@ -53,9 +53,10 @@ impl Tab {
 }
 
 /// Leaving the editor any way (back to the library, opening another project,
-/// quitting) finishes a voice-over in progress and saves.
+/// quitting) cancels a running export, finishes a voice-over in progress and saves.
 impl Drop for Editor {
     fn drop(&mut self) {
+        self.cancel_export();
         if self.voice.is_some() {
             self.stop_voiceover();
         }
@@ -558,7 +559,26 @@ impl Editor {
         let _ = v2;
     }
 
+    /// Whether an export started from this editor is still running.
+    pub fn export_running(&self) -> bool {
+        self.export.running.is_some()
+    }
+    /// Stop a running export and wait for its thread, which removes its temp
+    /// file. Nothing is left at the output path, and no result is shown.
+    pub fn cancel_export(&mut self) {
+        if let Some(mut run) = self.export.running.take() {
+            run.cancel.store(true, Ordering::SeqCst);
+            if let Some(handle) = run.handle.take() {
+                let _ = handle.join();
+            }
+            self.export.result = None;
+            self.copy_when_exported = false;
+        }
+    }
     pub fn start_export(&mut self) {
+        if self.export.running.is_some() {
+            return;
+        }
         let settings = self.project.export;
         let output = export::default_output(&self.package.root, &settings);
         let job = Job {
