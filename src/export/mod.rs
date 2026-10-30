@@ -256,15 +256,26 @@ pub fn run(job: &Job, progress: ProgressFn, cancel: &AtomicBool) -> Result<Stats
     if let Some(parent) = job.output.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = partial_path(&job.output);
-    let result = run_passes(job, &tmp, progress, cancel).and_then(|stats| {
-        std::fs::rename(&tmp, &job.output).with_context(|| format!("saving {}", job.output.display()))?;
-        Ok(stats)
-    });
-    if result.is_err() {
-        discard_partial(&tmp);
+    run_into_place(&job.output, |tmp| run_passes(job, tmp, progress, cancel))
+}
+/// Run `encode` into a temp file beside `output`, then rename it over `output`. The temp file
+/// is removed on an error and on a panic, so a crashed export thread leaves nothing behind.
+fn run_into_place(output: &Path, encode: impl FnOnce(&Path) -> Result<Stats>) -> Result<Stats> {
+    let mut guard = PartialGuard(Some(partial_path(output)));
+    let tmp = guard.0.clone().expect("armed");
+    let stats = encode(&tmp)?;
+    std::fs::rename(&tmp, output).with_context(|| format!("saving {}", output.display()))?;
+    guard.0 = None;
+    Ok(stats)
+}
+/// Discards the temp file when dropped, unless the rename already moved it.
+struct PartialGuard(Option<PathBuf>);
+impl Drop for PartialGuard {
+    fn drop(&mut self) {
+        if let Some(tmp) = &self.0 {
+            discard_partial(tmp);
+        }
     }
-    result
 }
 /// The encode itself, into `out`: one pass, or two when fit-to-size needs a correction.
 fn run_passes(job: &Job, out: &Path, progress: ProgressFn, cancel: &AtomicBool) -> Result<Stats> {
@@ -530,6 +541,57 @@ mod tests {
         move |p| set.contains(p)
     }
 
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("glide-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+    fn no_stats() -> Stats {
+        Stats { width: 2, height: 2, frames: 1, bytes: 1, seconds: 0.0, video_seconds: 1.0 }
+    }
+    #[test]
+    fn a_panicking_export_leaves_no_partial_file() {
+        let dir = scratch("panic-export");
+        let out = dir.join("Demo.mp4");
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_into_place(&out, |tmp| {
+                std::fs::write(tmp, b"half").unwrap();
+                std::fs::write(format!("{}.sb-1", tmp.display()), b"x").unwrap();
+                panic!("encoder blew up");
+            })
+        }));
+        assert!(r.is_err());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn a_failed_export_removes_its_partial_and_keeps_the_old_file() {
+        let dir = scratch("failed-export");
+        let out = dir.join("Demo.mp4");
+        std::fs::write(&out, b"old").unwrap();
+        let r = run_into_place(&out, |tmp| {
+            std::fs::write(tmp, b"half").unwrap();
+            anyhow::bail!("no space")
+        });
+        assert!(r.is_err());
+        assert_eq!(std::fs::read(&out).unwrap(), b"old");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn a_finished_export_is_renamed_into_place() {
+        let dir = scratch("done-export");
+        let out = dir.join("Demo.mp4");
+        run_into_place(&out, |tmp| {
+            std::fs::write(tmp, b"new").unwrap();
+            Ok(no_stats())
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"new");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn a_free_name_is_used_as_it_is() {
         assert_eq!(unique_path(Path::new("/m/Demo.mp4"), taken(&[])), Path::new("/m/Demo.mp4"));
