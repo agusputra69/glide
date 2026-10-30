@@ -1394,7 +1394,7 @@ impl App {
         }
         let s = &self.settings;
         if s.source == SourceKind::Device {
-            return s.ios_device.clone().map(|id| livecap::Source::Device { id });
+            return home::listed_ios_id(s.ios_device.as_deref(), &self.devices.ios).map(|id| livecap::Source::Device { id });
         }
         if crate::capture::tcc::screen_status() != crate::capture::tcc::Status::Granted {
             return None;
@@ -1516,6 +1516,7 @@ impl App {
         } else {
             match s.source {
                 SourceKind::Window if s.window.is_none() => Some("Choose a window to see it here.".into()),
+                SourceKind::Device if self.devices.ios.is_empty() => Some(home::IOS_CONNECT_HINT.into()),
                 SourceKind::Device if s.ios_device.is_none() => Some("Connect an iPhone or iPad to see it here.".into()),
                 SourceKind::Device => None,
                 _ if crate::capture::tcc::screen_status() != crate::capture::tcc::Status::Granted => {
