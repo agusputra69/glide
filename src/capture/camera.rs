@@ -5,13 +5,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
+use block2::RcBlock;
 use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
+use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{AnyThread, DefinedClass, define_class, msg_send};
 use objc2_av_foundation::*;
 use objc2_core_media::CMSampleBuffer;
 use objc2_core_video::{CVPixelBufferGetHeight, CVPixelBufferGetWidth, kCVPixelBufferPixelFormatTypeKey};
-use objc2_foundation::{NSArray, NSObject, NSObjectProtocol};
+use objc2_foundation::{NSArray, NSError, NSNotification, NSNotificationCenter, NSObject, NSObjectProtocol};
 use dispatch2::DispatchQueue;
 
 use crate::capture::record::Shared;
@@ -332,6 +333,67 @@ pub fn use_native_format(session: &AVCaptureSession) {
     }
 }
 
+/// What to tell the user when a capture session reports a runtime error.
+pub fn runtime_error_text(description: Option<&str>) -> String {
+    match description.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => format!("The capture session stopped: {d}"),
+        None => "The capture session stopped unexpectedly.".into(),
+    }
+}
+
+/// What to tell the user when the device itself goes away.
+pub const IOS_DISCONNECTED: &str = "The iPhone/iPad was disconnected.";
+
+/// Reports a session's runtime errors and its device's disconnection through
+/// `report`, until dropped (which removes the observers).
+pub struct SessionWatch {
+    tokens: Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
+}
+
+// SAFETY: the tokens are only kept to be removed from the notification center,
+// which is thread-safe.
+unsafe impl Send for SessionWatch {}
+
+impl SessionWatch {
+    pub fn new(session: &AVCaptureSession, device: &AVCaptureDevice, disconnected: &'static str, report: Arc<dyn Fn(String) + Send + Sync>) -> Self {
+        let center = NSNotificationCenter::defaultCenter();
+        let on_error = {
+            let report = report.clone();
+            RcBlock::new(move |n: std::ptr::NonNull<NSNotification>| {
+                // SAFETY: a valid notification for the duration of the call.
+                let description = unsafe {
+                    let n = n.as_ref();
+                    n.userInfo()
+                        .and_then(|u| u.objectForKey(AVCaptureSessionErrorKey))
+                        .and_then(|e| e.downcast::<NSError>().ok())
+                        .map(|e| e.localizedDescription().to_string())
+                };
+                report(runtime_error_text(description.as_deref()));
+            })
+        };
+        let on_gone = RcBlock::new(move |_: std::ptr::NonNull<NSNotification>| report(disconnected.to_string()));
+        // SAFETY: observers on notifications of objects we hold; the blocks
+        // are Send + Sync closures, and `Drop` removes the observers.
+        let tokens = unsafe {
+            vec![
+                center.addObserverForName_object_queue_usingBlock(Some(AVCaptureSessionRuntimeErrorNotification), Some(session), None, &on_error),
+                center.addObserverForName_object_queue_usingBlock(Some(AVCaptureDeviceWasDisconnectedNotification), Some(device), None, &on_gone),
+            ]
+        };
+        SessionWatch { tokens }
+    }
+}
+
+impl Drop for SessionWatch {
+    fn drop(&mut self) {
+        let center = NSNotificationCenter::defaultCenter();
+        for t in self.tokens.drain(..) {
+            // SAFETY: the token came from addObserverForName in `new`.
+            unsafe { center.removeObserver(AsRef::<AnyObject>::as_ref(&*t)) };
+        }
+    }
+}
+
 pub struct CamIvars {
     shared: Arc<Shared>,
     /// Deliver frames as the sink's primary ("screen") video, for a
@@ -385,6 +447,8 @@ define_class!(
 );
 
 pub struct Camera {
+    /// First, so the observers go before the session does.
+    _watch: Option<SessionWatch>,
     session: Retained<AVCaptureSession>,
     _out: Retained<CameraOutput>,
     _queue: dispatch2::DispatchRetained<DispatchQueue>,
@@ -436,6 +500,14 @@ impl Camera {
                 num_i(PIX_BGRA as i64),
             )])));
             output.setAlwaysDiscardsLateVideoFrames(true);
+            // Only an iPhone/iPad ends the take: it is the recording's one video.
+            let watch = ios.is_some().then(|| {
+                let shared = shared.clone();
+                SessionWatch::new(&session, &dev, IOS_DISCONNECTED, Arc::new(move |m| {
+                    eprintln!("glide: ios recording: {m}");
+                    shared.fail(m);
+                }))
+            });
             let delegate = Self::make_delegate(shared, as_screen, ios);
             let queue = DispatchQueue::new("rec.camera", None);
             output.setSampleBufferDelegate_queue(Some(ProtocolObject::from_ref(&*delegate)), Some(&queue));
@@ -448,7 +520,7 @@ impl Camera {
             if !session.isRunning() {
                 bail!("camera {name} failed to start");
             }
-            Ok(Camera { session, _out: delegate, _queue: queue, name })
+            Ok(Camera { _watch: watch, session, _out: delegate, _queue: queue, name })
         }
     }
 
@@ -620,6 +692,13 @@ mod tests {
         assert_eq!(run, 5);
         assert_eq!(mismatch_run(run, true), 0);
         assert_eq!(mismatch_run(u32::MAX, false), u32::MAX);
+    }
+
+    #[test]
+    fn runtime_error_text_uses_the_description_or_a_fallback() {
+        assert_eq!(runtime_error_text(Some("Cannot Record")), "The capture session stopped: Cannot Record");
+        assert_eq!(runtime_error_text(Some("  ")), "The capture session stopped unexpectedly.");
+        assert_eq!(runtime_error_text(None), "The capture session stopped unexpectedly.");
     }
 
     #[test]

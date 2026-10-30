@@ -230,6 +230,10 @@ enum Capture {
 
 /// A running preview stream; stops when dropped.
 pub struct LivePreview {
+    /// First, so the observers go before the session does.
+    _watch: Option<camera::SessionWatch>,
+    /// A runtime error or disconnect of an iPhone/iPad session, until read.
+    runtime_error: Arc<Mutex<Option<String>>>,
     capture: Capture,
     _output: Retained<PreviewOutput>,
     _queue: dispatch2::DispatchRetained<DispatchQueue>,
@@ -338,7 +342,7 @@ impl LivePreview {
                     .map_err(|e| anyhow::anyhow!("preview audio: {}", e.localizedDescription()))?;
             }
             wait(|b| stream.startCaptureWithCompletionHandler(Some(b))).context("starting the preview")?;
-            Ok(LivePreview { capture: Capture::Screen(stream), _output: output, _queue: queue, latest, level, target })
+            Ok(LivePreview { _watch: None, runtime_error: Arc::default(), capture: Capture::Screen(stream), _output: output, _queue: queue, latest, level, target })
         }
     }
 
@@ -374,7 +378,10 @@ impl LivePreview {
             out.setAlwaysDiscardsLateVideoFrames(true);
             let latest = Arc::new(Mutex::new(None));
             let target = Arc::new(AtomicU64::new(0));
-            let output = PreviewOutput::create(latest.clone(), Arc::new(AtomicU32::new(0)), target.clone(), false, Box::new(on_frame));
+            // Also called when the session reports an error, so the UI looks.
+            let on_frame = Arc::new(on_frame);
+            let wake = on_frame.clone();
+            let output = PreviewOutput::create(latest.clone(), Arc::new(AtomicU32::new(0)), target.clone(), false, Box::new(move || on_frame()));
             let queue = DispatchQueue::new("glide.preview.camera", None);
             out.setSampleBufferDelegate_queue(Some(ProtocolObject::from_ref(&*output)), Some(&queue));
             if !session.canAddOutput(&out) {
@@ -382,12 +389,29 @@ impl LivePreview {
             }
             session.addOutput(&out);
             session.commitConfiguration();
+            let runtime_error = Arc::new(Mutex::new(None));
+            // Only iPhones are watched: a webcam preview that stops just
+            // freezes, as before.
+            let watch = ios.then(|| {
+                let (slot, name) = (runtime_error.clone(), name.clone());
+                camera::SessionWatch::new(&session, &dev, camera::IOS_DISCONNECTED, Arc::new(move |m| {
+                    eprintln!("glide: ios preview {name}: {m}");
+                    slot.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(m);
+                    wake();
+                }))
+            });
             session.startRunning();
             if !session.isRunning() {
                 bail!("{name} failed to start");
             }
-            Ok(LivePreview { capture: Capture::Camera(session), _output: output, _queue: queue, latest, level: Arc::new(AtomicU32::new(0)), target })
+            Ok(LivePreview { _watch: watch, runtime_error, capture: Capture::Camera(session), _output: output, _queue: queue, latest, level: Arc::new(AtomicU32::new(0)), target })
         }
+    }
+
+    /// The runtime error or disconnect an iPhone/iPad session reported since
+    /// the last call.
+    pub fn take_runtime_error(&self) -> Option<String> {
+        self.runtime_error.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
     /// Peak audio level (0..1) since the last call; 0 without audio.

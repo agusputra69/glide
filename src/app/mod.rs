@@ -167,14 +167,7 @@ impl<K: Clone + PartialEq + Send + 'static, V: Send + 'static> Slot<K, V> {
                     self.running = Some((k, v));
                 }
                 Ok(v) => drop(std::thread::spawn(move || drop(v))),
-                Err(e) => {
-                    if self.logged.as_deref() != Some(e.as_str()) {
-                        eprintln!("glide: {name}: {e}");
-                        self.logged = Some(e.clone());
-                    }
-                    self.failed = Some((k, e));
-                    self.failed_at = Some(Instant::now());
-                }
+                Err(e) => self.fail(k, name, e),
             }
         }
         // Wait for edits (an area being typed in) to settle before starting.
@@ -198,6 +191,27 @@ impl<K: Clone + PartialEq + Send + 'static, V: Send + 'static> Slot<K, V> {
 
     fn active(&self) -> bool {
         self.running.is_some() || self.starting.is_some()
+    }
+
+    /// Record `k` as failed with `e`, printing the text unless the last
+    /// failure said the same.
+    fn fail(&mut self, k: K, name: &str, e: String) {
+        if self.logged.as_deref() != Some(e.as_str()) {
+            eprintln!("glide: {name}: {e}");
+            self.logged = Some(e.clone());
+        }
+        self.failed = Some((k, e));
+        self.failed_at = Some(Instant::now());
+    }
+
+    /// Stop the running value because it reported `msg`, and count its key as
+    /// failed (so `retry_failed` can bring it back). Returns true if
+    /// something was running, whose output is then stale.
+    fn fail_running(&mut self, name: &str, msg: String) -> bool {
+        let Some((k, v)) = self.running.take() else { return false };
+        std::thread::spawn(move || drop(v));
+        self.fail(k, name, msg);
+        true
     }
 
     /// Forget a failure so the wanted key starts again on the next `update`.
@@ -1475,6 +1489,13 @@ impl App {
         let camera = (visible && s.camera).then(|| livecap::Source::Camera { id: s.camera_id.clone() });
         let mic = (visible && s.mic && self.selftest.is_none()).then(|| s.mic_id.as_ref().and_then(|id| self.devices.mics.iter().find(|m| &m.id == id)).map(|m| m.name.clone()));
         let live = &mut self.live;
+        // An iPhone preview that reports an error or a disconnect is stopped
+        // and shows the text; the retry brings it back.
+        if let Some(msg) = live.screen.running.as_ref().and_then(|(_, p)| p.take_runtime_error())
+            && live.screen.fail_running("live preview", msg)
+        {
+            live.tex = None;
+        }
         // Screens at native resolution, scaled to the canvas (30 fps, as Rec);
         // in light mode small and at 15 fps (5K frames swamp older Macs).
         if live.screen.update(screen, "live preview", |(src, audio)| {
@@ -2311,6 +2332,39 @@ mod tests {
         assert!(slot.retry_failed(t0 + Duration::from_secs(3), Duration::from_secs(2)));
         assert_eq!(slot.error(), None);
         assert!(!slot.retry_failed(t0 + Duration::from_secs(9), Duration::from_secs(2)), "nothing left to retry");
+    }
+
+    fn starts_fine(_: &u8) -> Result<u8, String> {
+        Ok(3)
+    }
+
+    #[test]
+    fn slot_fail_running_stops_the_value_and_shows_the_message() {
+        let mut slot = TestSlot::default();
+        slot.update(Some(1), "test", starts_fine);
+        settled(&mut slot);
+        pump(&mut slot, Some(1), starts_fine, |s| s.running.is_some());
+        assert!(slot.fail_running("test", "The iPhone/iPad was disconnected.".into()));
+        assert!(slot.running.is_none());
+        assert_eq!(slot.error(), Some("The iPhone/iPad was disconnected."));
+        // Nothing is running any more, so a second report changes nothing.
+        assert!(!slot.fail_running("test", "again".into()));
+        assert_eq!(slot.error(), Some("The iPhone/iPad was disconnected."));
+    }
+
+    #[test]
+    fn slot_starts_again_after_fail_running_once_the_retry_interval_passes() {
+        let mut slot = TestSlot::default();
+        slot.update(Some(1), "test", starts_fine);
+        settled(&mut slot);
+        pump(&mut slot, Some(1), starts_fine, |s| s.running.is_some());
+        slot.fail_running("test", "locked".into());
+        // Failed keys are not restarted until the retry clears them.
+        slot.update(Some(1), "test", starts_fine);
+        assert!(slot.starting.is_none() && slot.running.is_none());
+        let later = slot.failed_at.unwrap() + Duration::from_secs(3);
+        assert!(slot.retry_failed(later, IOS_RETRY));
+        pump(&mut slot, Some(1), starts_fine, |s| s.running.is_some());
     }
 
     #[test]
