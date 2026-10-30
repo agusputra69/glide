@@ -15,7 +15,7 @@ use super::theme::{self, pal};
 use super::widgets::{self, fmt_time};
 use super::{inspector, timeline};
 use crate::export::{self, Job, Source, Stats};
-use crate::project::model::{Codec, ExportFormat, ExportSettings, Project, Quality, Slice, Zoom};
+use crate::project::model::{Codec, ExportFormat, ExportSettings, FormatMemory, Project, Quality, Slice, Zoom};
 use crate::project::recording::Recording;
 use crate::project::Package;
 use crate::render::Gpu;
@@ -124,6 +124,8 @@ pub struct Editor {
     redo: Vec<Project>,
     last_commit: Option<Instant>,
     dirty_at: Option<Instant>,
+    /// Export settings per format; they are not part of the undo history.
+    export_memory: FormatMemory,
     pub export: ExportState,
     /// Timeline pixels per second.
     pub px_per_sec: f32,
@@ -179,6 +181,7 @@ impl Editor {
                 *peaks.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
             });
         }
+        let export_memory = FormatMemory::new(project.export);
         Ok(Editor {
             package,
             project,
@@ -193,6 +196,7 @@ impl Editor {
             redo: vec![],
             last_commit: None,
             dirty_at: None,
+            export_memory,
             export: ExportState::default(),
             px_per_sec: 80.0,
             status: None,
@@ -271,21 +275,31 @@ impl Editor {
     }
 
     pub fn undo(&mut self) {
-        if let Some(p) = self.undo.pop() {
+        if let Some(mut p) = self.undo.pop() {
             self.redo.push(self.project.clone());
             self.last_commit = None;
+            p.export = self.project.export;
             self.apply(p);
         }
     }
 
     pub fn redo(&mut self) {
-        if let Some(p) = self.redo.pop() {
+        if let Some(mut p) = self.redo.pop() {
             self.undo.push(self.project.clone());
             self.last_commit = None;
+            p.export = self.project.export;
             self.apply(p);
         }
     }
 
+    /// Change the export settings. They are saved with the project but are
+    /// not an edit: no undo step, and undo and redo leave them as they are.
+    pub fn set_export(&mut self, s: ExportSettings) {
+        if s != self.project.export {
+            self.project.export = s;
+            self.dirty_at = Some(Instant::now());
+        }
+    }
     pub fn edit(&mut self, f: impl FnOnce(&mut Project)) {
         let mut d = self.project.clone();
         f(&mut d);
@@ -994,7 +1008,7 @@ impl Editor {
                         let before = s.format;
                         widgets::segmented(ui, &mut s.format, &[(ExportFormat::Gif, "GIF"), (ExportFormat::Mp4, "MP4")]);
                         if s.format != before {
-                            s = if s.format == ExportFormat::Gif { ExportSettings::gif_default() } else { ExportSettings::default() };
+                            s = self.export_memory.switch(self.project.export, s.format);
                         }
                     });
                     let (heights, fpss): (&[u32], &[u32]) = match s.format {
@@ -1052,11 +1066,7 @@ impl Editor {
                         widgets::caption(ui, &format!("This Mac's video encoder can't take {rw}×{rh}, so it exports at {w}×{h}"));
                     }
                 });
-                if s != self.project.export {
-                    let mut d = self.project.clone();
-                    d.export = s;
-                    self.commit(d);
-                }
+                self.set_export(s);
                 ui.add_space(8.0);
                 if let Some(run) = &self.export.running {
                     let f = run.progress();

@@ -847,6 +847,38 @@ impl Default for ExportSettings {
     }
 }
 
+/// The last settings used for each export format, so switching MP4 to GIF
+/// and back brings each side back as it was left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FormatMemory {
+    mp4: ExportSettings,
+    gif: ExportSettings,
+}
+impl FormatMemory {
+    /// Remember `current` for its format; the other starts at its defaults.
+    pub fn new(current: ExportSettings) -> Self {
+        let mut m = FormatMemory { mp4: ExportSettings::default(), gif: ExportSettings::gif_default() };
+        m.remember(current);
+        m
+    }
+    pub fn remember(&mut self, s: ExportSettings) {
+        match s.format {
+            ExportFormat::Mp4 => self.mp4 = s,
+            ExportFormat::Gif => self.gif = s,
+        }
+    }
+    pub fn recall(&self, format: ExportFormat) -> ExportSettings {
+        match format {
+            ExportFormat::Mp4 => self.mp4,
+            ExportFormat::Gif => self.gif,
+        }
+    }
+    /// Leave the format of `leaving` (remembering it) for `to`.
+    pub fn switch(&mut self, leaving: ExportSettings, to: ExportFormat) -> ExportSettings {
+        self.remember(leaving);
+        self.recall(to)
+    }
+}
 impl ExportSettings {
     pub const MP4_FPS: [u32; 7] = [60, 50, 30, 25, 24, 20, 10];
     pub const GIF_FPS: [u32; 6] = [50, 30, 25, 20, 15, 10];
@@ -1060,6 +1092,25 @@ mod tests {
         assert_eq!(z.start, 0.0);
     }
 
+    #[test]
+    fn switching_format_and_back_keeps_each_sides_settings() {
+        let mp4 = ExportSettings { height: 1080, fps: 30, quality: Quality::Web, codec: Codec::Hevc, target_mb: Some(20), ..Default::default() };
+        let mut mem = FormatMemory::new(mp4);
+        let gif = mem.switch(mp4, ExportFormat::Gif);
+        assert_eq!(gif, ExportSettings::gif_default());
+        let edited = ExportSettings { fps: 10, height: 360, gif_loop: false, ..gif };
+        assert_eq!(mem.switch(edited, ExportFormat::Mp4), mp4);
+        assert_eq!(mem.switch(mp4, ExportFormat::Gif), edited);
+    }
+    #[test]
+    fn a_new_memory_offers_the_other_formats_defaults() {
+        let mem = FormatMemory::new(ExportSettings::default());
+        assert_eq!(mem.recall(ExportFormat::Gif), ExportSettings::gif_default());
+        let gif = ExportSettings { fps: 10, ..ExportSettings::gif_default() };
+        let mem = FormatMemory::new(gif);
+        assert_eq!(mem.recall(ExportFormat::Gif), gif);
+        assert_eq!(mem.recall(ExportFormat::Mp4), ExportSettings::default());
+    }
     #[test]
     fn span_at_start_of_the_recording() {
         assert_eq!(span_at(0.0, 3000.0, 300.0, 10_000.0), (0.0, 3000.0));
