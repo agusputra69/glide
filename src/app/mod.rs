@@ -19,6 +19,7 @@ pub mod timeline;
 pub mod updater;
 pub mod voiceover;
 pub mod recbar;
+pub mod restart;
 pub mod widgets;
 pub mod winpick;
 
@@ -322,6 +323,9 @@ struct App {
     /// When playback's next preview frame is due (redraws are paced to it).
     next_frame_at: Option<Instant>,
     finished: Arc<Mutex<Option<Finished>>>,
+    restart: restart::Restart,
+    /// Set by the thread that cancels the old take of a restart.
+    restart_done: Arc<AtomicBool>,
     error: Option<String>,
     menubar: Option<menubar::MenuBar>,
     last_tick: Instant,
@@ -381,6 +385,8 @@ impl App {
             stale_textures: vec![],
             next_frame_at: None,
             finished: Arc::new(Mutex::new(None)),
+            restart: restart::Restart::Idle,
+            restart_done: Arc::new(AtomicBool::new(false)),
             error: None,
             menubar: None,
             last_tick: Instant::now(),
@@ -651,7 +657,7 @@ impl App {
     }
 
     fn start_recording(&mut self, _el: &ActiveEventLoop) {
-        if self.recording.is_some() || self.finishing {
+        if self.recording.is_some() || self.finishing || self.restart.busy() {
             return;
         }
         self.error = None;
@@ -720,22 +726,50 @@ impl App {
         });
     }
 
-    /// Discard the current recording (if any). `restarting` keeps the main
-    /// window hidden and finishes the cancel before a new one starts.
-    fn cancel_recording(&mut self, restarting: bool) {
+    /// Discard the current recording (if any).
+    fn cancel_recording(&mut self) {
         let Some(rec) = self.recording.take() else { return };
         if let Some(r) = rec.rec {
-            if restarting {
-                objc2::rc::autoreleasepool(|_| r.cancel());
-            } else {
-                std::thread::spawn(move || objc2::rc::autoreleasepool(|_| r.cancel()));
+            Self::spawn_cancel(r, None);
+        }
+        self.close_bar();
+        push(Cmd::ShowWindow);
+    }
+
+    /// Cancel a take off the main thread, then set `done` and wake the loop.
+    fn spawn_cancel(r: Recorder, done: Option<Arc<AtomicBool>>) {
+        std::thread::spawn(move || {
+            // Report back even if the cancel panics, so a restart can't hang.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| objc2::rc::autoreleasepool(|_| r.cancel())));
+            if let Some(done) = done {
+                done.store(true, Ordering::SeqCst);
+            }
+            wake();
+        });
+    }
+
+    /// Feed a restart event to the state machine and do what it says.
+    fn restart_event(&mut self, el: &ActiveEventLoop, event: restart::Event) {
+        let (next, action) = restart::step(self.restart, event);
+        self.restart = next;
+        match action {
+            restart::Do::Nothing => {}
+            restart::Do::CancelOldTake => match self.recording.take().and_then(|rec| rec.rec) {
+                Some(r) => Self::spawn_cancel(r, Some(self.restart_done.clone())),
+                // Still counting down: there is no recorder to cancel.
+                None => self.restart_event(el, restart::Event::Cancelled),
+            },
+            restart::Do::StartNewTake => self.start_recording(el),
+            restart::Do::CloseBar => {
+                self.close_bar();
+                push(Cmd::ShowWindow);
             }
         }
-        // Restarting keeps the recording bar up for the new take.
-        if !restarting {
-            self.close_bar();
-            push(Cmd::ShowWindow);
-        }
+    }
+
+    /// A save or a restart's cancel is still running.
+    fn winding_down(&self) -> bool {
+        (self.finishing && self.finished.lock().unwrap().is_none()) || (self.restart.busy() && !self.restart_done.load(Ordering::SeqCst))
     }
 
     /// Remove the recording bar, remembering where it was.
@@ -759,13 +793,14 @@ impl App {
                     if r.is_paused() { r.resume() } else { r.pause() }
                 }
             }
-            Cmd::Restart => {
-                if self.recording.is_some() {
-                    self.cancel_recording(true);
-                    self.start_recording(el);
+            Cmd::Restart => self.restart_event(el, restart::Event::Requested { recording: self.recording.is_some() }),
+            Cmd::Cancel => {
+                if self.restart.busy() {
+                    self.restart_event(el, restart::Event::Aborted);
+                } else {
+                    self.cancel_recording();
                 }
             }
-            Cmd::Cancel => self.cancel_recording(false),
             Cmd::ShowWindow => self.show_main(el),
             Cmd::OpenFolder => macos::open_folder(&self.settings.dir()),
             Cmd::StartUpdater => updater::start(),
@@ -775,7 +810,7 @@ impl App {
                 self.open_project(el, p, Leaving::OpenProject);
             }
             Cmd::RecordSource(kind) => {
-                if self.recording.is_some() {
+                if self.recording.is_some() || self.restart.busy() {
                     return;
                 }
                 self.settings.source = kind;
@@ -787,7 +822,7 @@ impl App {
                 }
             }
             Cmd::SelectArea(record_after) => {
-                if self.recording.is_some() {
+                if self.recording.is_some() || self.restart.busy() {
                     return;
                 }
                 // Pick on the display under the pointer.
@@ -805,7 +840,7 @@ impl App {
                 self.open_overlays(el, id);
             }
             Cmd::SelectWindow(record_after) => {
-                if self.recording.is_some() {
+                if self.recording.is_some() || self.restart.busy() {
                     return;
                 }
                 // Pick on the display under the pointer.
@@ -826,7 +861,7 @@ impl App {
                     self.stop_recording();
                 }
                 let deadline = Instant::now() + Duration::from_secs(60);
-                while self.finishing && self.finished.lock().unwrap().is_none() && Instant::now() < deadline {
+                while self.winding_down() && Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 el.exit();
@@ -840,6 +875,9 @@ impl App {
             self.handle(el, c);
         }
         self.update_live();
+        if self.restart.busy() && self.restart_done.swap(false, Ordering::SeqCst) {
+            self.restart_event(el, restart::Event::Cancelled);
+        }
         if let Some(rec) = &self.recording
             && rec.rec.is_none()
             && rec.countdown_until.is_some_and(|t| Instant::now() >= t)
@@ -880,6 +918,7 @@ impl App {
         let paused = matches!(&self.recording, Some(Recording { rec: Some(r), .. }) if r.is_paused());
         if let Some(b) = &mut self.bar {
             b.update(match &self.recording {
+                _ if self.restart.busy() => recbar::State::Restarting,
                 Some(Recording { rec: None, countdown_until: Some(t) }) => recbar::State::Countdown(t.saturating_duration_since(Instant::now()).as_secs() + 1),
                 _ => recbar::State::Recording { clock: clock.clone(), paused },
             });
@@ -2067,7 +2106,7 @@ impl ApplicationHandler for App {
             }
         }
         let deadline = Instant::now() + Duration::from_secs(60);
-        while self.finishing && self.finished.lock().unwrap().is_none() && Instant::now() < deadline {
+        while self.winding_down() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
         if !self.scripted() {
@@ -2084,7 +2123,7 @@ impl ApplicationHandler for App {
             View::Editor(ed) => (ed.tick(), ed.background_busy()),
             View::Start => (false, false),
         };
-        let live = self.recording.is_some() || self.finishing;
+        let live = self.recording.is_some() || self.finishing || self.restart.busy();
         let now = Instant::now();
         let mut next = now + Duration::from_millis(if live { 200 } else { 500 });
         // Nothing to show while the window is hidden or covered.
