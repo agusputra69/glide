@@ -11,10 +11,10 @@ pub mod gif;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use crate::engine::scene::Scene;
 use crate::media::{FrameSource, Prefetch};
@@ -248,9 +248,28 @@ impl FramePump {
 }
 
 /// Run an export job. `progress` receives 0..1; `cancel` aborts.
+///
+/// Frames go to a hidden temp file in the output's folder, which replaces `job.output` in one
+/// rename after the last pass succeeds. A failed or cancelled run removes the temp file and
+/// leaves whatever was at `job.output` alone.
 pub fn run(job: &Job, progress: ProgressFn, cancel: &AtomicBool) -> Result<Stats> {
+    if let Some(parent) = job.output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = partial_path(&job.output);
+    let result = run_passes(job, &tmp, progress, cancel).and_then(|stats| {
+        std::fs::rename(&tmp, &job.output).with_context(|| format!("saving {}", job.output.display()))?;
+        Ok(stats)
+    });
+    if result.is_err() {
+        discard_partial(&tmp);
+    }
+    result
+}
+/// The encode itself, into `out`: one pass, or two when fit-to-size needs a correction.
+fn run_passes(job: &Job, out: &Path, progress: ProgressFn, cancel: &AtomicBool) -> Result<Stats> {
     let s = job.settings;
-    let stats = run_pass(job, None, progress, cancel)?;
+    let stats = run_pass(job, out, None, progress, cancel)?;
     // "Fit to size" means at most that size: VideoToolbox's average bitrate
     // can overshoot, so re-encode once with a corrected bitrate if it did.
     if s.fits_size()
@@ -263,7 +282,7 @@ pub fn run(job: &Job, progress: ProgressFn, cancel: &AtomicBool) -> Result<Stats
             let video_now = (stats.bytes as f64 - audio).max(1.0);
             let video_goal = (target * 0.95 - audio).max(target * 0.2);
             let corrected = (planned * video_goal / video_now).max(250_000.0) as u64;
-            let mut again = run_pass(job, Some(corrected), progress, cancel)?;
+            let mut again = run_pass(job, out, Some(corrected), progress, cancel)?;
             again.seconds += stats.seconds;
             return Ok(again);
         }
@@ -286,7 +305,7 @@ pub fn output_size(sizes: &crate::engine::sizes::Sizes, s: &ExportSettings) -> (
     }
 }
 
-fn run_pass(job: &Job, bitrate: Option<u64>, progress: ProgressFn, cancel: &AtomicBool) -> Result<Stats> {
+fn run_pass(job: &Job, out: &Path, bitrate: Option<u64>, progress: ProgressFn, cancel: &AtomicBool) -> Result<Stats> {
     let started = Instant::now();
     let s = job.settings;
     let mut scene = Scene::new(job.project.clone(), &job.recording, s.fps as f64);
@@ -304,14 +323,11 @@ fn run_pass(job: &Job, bitrate: Option<u64>, progress: ProgressFn, cancel: &Atom
         let times: Vec<f64> = (0..total).map(|i| scene.map.to_source(i as f64 * 1000.0 / s.fps as f64)).collect();
         inputs.prefetch(job, &times);
     }
-    if let Some(parent) = job.output.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let result = match s.format {
         ExportFormat::Mp4 => {
             let soundtrack = audio::mix(&job.project, &job.recording, dir, &scene.map);
             let mut writer = MovieWriter::create(
-                &job.output,
+                out,
                 &WriterSpec {
                     width: w,
                     height: h,
@@ -338,16 +354,16 @@ fn run_pass(job: &Job, bitrate: Option<u64>, progress: ProgressFn, cancel: &Atom
                 }
                 Err(e) => {
                     writer.cancel();
-                    let _ = std::fs::remove_file(&job.output);
+                    let _ = std::fs::remove_file(out);
                     Err(e)
                 }
             }
         }
-        ExportFormat::Gif => gif::encode(job, &mut scene, &mut pump, &mut inputs, total, progress, cancel),
+        ExportFormat::Gif => gif::encode(job, out, &mut scene, &mut pump, &mut inputs, total, progress, cancel),
     };
     let frames = result?;
     progress(1.0);
-    let bytes = std::fs::metadata(&job.output).map(|m| m.len()).unwrap_or(0);
+    let bytes = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
     Ok(Stats {
         frames,
         width: w,
@@ -470,7 +486,8 @@ fn mp4_readback(
     Ok(done)
 }
 
-/// Default output path next to the package.
+/// Default output path next to the package, one that doesn't exist yet: `Name.mp4`, then
+/// `Name 2.mp4`, `Name 3.mp4`…
 pub fn default_output(package: &Path, settings: &ExportSettings) -> PathBuf {
     let ext = match (settings.format, settings.codec) {
         (ExportFormat::Gif, _) => "gif",
@@ -478,5 +495,71 @@ pub fn default_output(package: &Path, settings: &ExportSettings) -> PathBuf {
         _ => "mp4",
     };
     let name = package.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "export".into());
-    package.with_file_name(format!("{name}.{ext}"))
+    unique_path(&package.with_file_name(format!("{name}.{ext}")), Path::exists)
+}
+/// `path` if `exists` says it's free, otherwise the first of `Name 2.ext`, `Name 3.ext`… that is.
+pub fn unique_path(path: &Path, exists: impl Fn(&Path) -> bool) -> PathBuf {
+    if !exists(path) {
+        return path.to_path_buf();
+    }
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    (2u64..).map(|n| path.with_file_name(format!("{stem} {n}{ext}"))).find(|p| !exists(p)).expect("an unused name")
+}
+/// A hidden, run-unique file beside `output` that an export is written to before it is renamed
+/// into place. It keeps the real extension because the movie writer picks the container from it.
+fn partial_path(output: &Path) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let stem = output.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "export".into());
+    let ext = output.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    output.with_file_name(format!(".{stem}.partial-{}-{n}{ext}", std::process::id()))
+}
+/// Remove an unfinished export and the `.sb-…` files AVFoundation can leave beside it.
+fn discard_partial(tmp: &Path) {
+    let _ = std::fs::remove_file(tmp);
+    crate::media::writer::remove_fast_start_leftovers(tmp);
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn taken(names: &[&str]) -> impl Fn(&Path) -> bool {
+        let set: HashSet<PathBuf> = names.iter().map(PathBuf::from).collect();
+        move |p| set.contains(p)
+    }
+
+    #[test]
+    fn a_free_name_is_used_as_it_is() {
+        assert_eq!(unique_path(Path::new("/m/Demo.mp4"), taken(&[])), Path::new("/m/Demo.mp4"));
+    }
+
+    #[test]
+    fn a_taken_name_gets_the_next_free_number() {
+        assert_eq!(unique_path(Path::new("/m/Demo.mp4"), taken(&["/m/Demo.mp4"])), Path::new("/m/Demo 2.mp4"));
+        let two = taken(&["/m/Demo.mp4", "/m/Demo 2.mp4"]);
+        assert_eq!(unique_path(Path::new("/m/Demo.mp4"), two), Path::new("/m/Demo 3.mp4"));
+        // A gap is filled, and other extensions don't count.
+        let gap = taken(&["/m/Demo.mp4", "/m/Demo 3.mp4", "/m/Demo 2.gif"]);
+        assert_eq!(unique_path(Path::new("/m/Demo.mp4"), gap), Path::new("/m/Demo 2.mp4"));
+    }
+
+    #[test]
+    fn a_name_without_an_extension_is_numbered_too() {
+        assert_eq!(unique_path(Path::new("Demo"), taken(&["Demo"])), Path::new("Demo 2"));
+    }
+
+    #[test]
+    fn the_partial_file_is_hidden_unique_and_keeps_the_extension() {
+        let a = partial_path(Path::new("/m/Demo.mp4"));
+        let b = partial_path(Path::new("/m/Demo.mp4"));
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), Some(Path::new("/m")));
+        let name = a.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with(".Demo.partial-") && name.ends_with(".mp4"), "{name}");
+        let bare = partial_path(Path::new("out.mov"));
+        assert_eq!(bare.parent(), Some(Path::new("")));
+        assert_eq!(bare.extension().unwrap(), "mov");
+    }
 }

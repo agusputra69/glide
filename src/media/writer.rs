@@ -335,7 +335,7 @@ impl MovieWriter {
 /// Optimising for network use (index first) rewrites the movie through a
 /// `<name>.sb-…` temporary that AVFoundation can leave next to the finished
 /// file; remove it.
-fn remove_fast_start_leftovers(path: &Path) {
+pub(crate) fn remove_fast_start_leftovers(path: &Path) {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else { return };
     let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
     let prefix = format!("{name}.sb-");
