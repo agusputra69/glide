@@ -564,14 +564,12 @@ impl Editor {
         self.export.running.is_some()
     }
     /// Stop a running export and wait for its thread, which removes its temp
-    /// file. Nothing is left at the output path, and no result is shown.
+    /// file. A cancelled run leaves nothing at the output path and shows no result. A run that
+    /// had already finished keeps its file and its result.
     pub fn cancel_export(&mut self) {
         if let Some(mut run) = self.export.running.take() {
             run.cancel.store(true, Ordering::SeqCst);
-            if let Some(handle) = run.handle.take() {
-                let _ = handle.join();
-            }
-            self.export.result = None;
+            self.export.result = run.handle.take().and_then(|handle| kept_after_cancel(handle.join(), &run.output));
             self.copy_when_exported = false;
         }
     }
@@ -642,12 +640,7 @@ impl Editor {
             && run.handle.as_ref().is_some_and(|h| h.is_finished())
         {
             let r = run.handle.take().unwrap().join();
-            let out = run.output.clone();
-            self.export.result = Some(match r {
-                Ok(Ok(stats)) => Ok((out, stats)),
-                Ok(Err(e)) => Err(format!("{e:#}")),
-                Err(_) => Err("export crashed".into()),
-            });
+            self.export.result = Some(run_result(r, &run.output));
             self.export.running = None;
             if self.copy_when_exported {
                 self.copy_when_exported = false;
@@ -1131,5 +1124,36 @@ fn res_label(h: u32) -> String {
         2160 => "4K".into(),
         1440 => "1440p (2K)".into(),
         _ => format!("{h}p"),
+    }
+}
+
+/// What a joined export thread produced, as the export sheet shows it.
+fn run_result(r: std::thread::Result<Result<Stats>>, output: &Path) -> Result<(PathBuf, Stats), String> {
+    match r {
+        Ok(Ok(stats)) => Ok((output.to_path_buf(), stats)),
+        Ok(Err(e)) => Err(format!("{e:#}")),
+        Err(_) => Err("export crashed".into()),
+    }
+}
+/// The result to keep when an export is cancelled: only a run that had already finished.
+fn kept_after_cancel(r: std::thread::Result<Result<Stats>>, output: &Path) -> Option<Result<(PathBuf, Stats), String>> {
+    run_result(r, output).ok().map(Ok)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn stats() -> Stats {
+        Stats { frames: 1, width: 2, height: 2, seconds: 0.0, video_seconds: 1.0, bytes: 1 }
+    }
+    #[test]
+    fn a_run_that_finished_before_the_cancel_keeps_its_result() {
+        let kept = kept_after_cancel(Ok(Ok(stats())), Path::new("/m/Demo.mp4"));
+        assert!(matches!(kept, Some(Ok((p, _))) if p == Path::new("/m/Demo.mp4")));
+    }
+    #[test]
+    fn a_cancelled_or_crashed_run_keeps_nothing() {
+        let out = Path::new("/m/Demo.mp4");
+        assert!(kept_after_cancel(Ok(Err(anyhow::anyhow!("cancelled"))), out).is_none());
+        assert!(kept_after_cancel(Err(Box::new("boom")), out).is_none());
     }
 }
