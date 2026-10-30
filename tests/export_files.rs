@@ -77,7 +77,7 @@ fn a_cancelled_mp4_export_keeps_the_file_it_would_have_replaced() {
     let out = dir.join("out.mp4");
     std::fs::write(&out, SENTINEL).unwrap();
     let before = names(&dir);
-    let err = run_cancelled(&job(&pkg, mp4_settings(), out.clone()), 10).err().expect("the run was cancelled");
+    let err = run_cancelled(&job(&pkg, mp4_settings(), out.clone()), 10).unwrap_err();
     assert!(err.to_string().contains("cancelled"), "{err:#}");
     assert_eq!(std::fs::read(&out).unwrap(), SENTINEL);
     assert_eq!(names(&dir), before);
@@ -91,7 +91,7 @@ fn a_cancelled_gif_export_keeps_the_file_it_would_have_replaced() {
     let out = dir.join("out.gif");
     std::fs::write(&out, SENTINEL).unwrap();
     let before = names(&dir);
-    let err = run_cancelled(&job(&pkg, gif_settings(), out.clone()), 10).err().expect("the run was cancelled");
+    let err = run_cancelled(&job(&pkg, gif_settings(), out.clone()), 10).unwrap_err();
     assert!(err.to_string().contains("cancelled"), "{err:#}");
     assert_eq!(std::fs::read(&out).unwrap(), SENTINEL);
     assert_eq!(names(&dir), before);
