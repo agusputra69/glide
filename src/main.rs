@@ -76,17 +76,18 @@ enum Cmd {
         output: Option<PathBuf>,
         #[arg(long, value_parser = ["mp4", "gif"])]
         format: Option<String>,
-        /// Output height in pixels; 0 = native (the recording's own pixels).
-        #[arg(long)]
+        /// Output height in pixels, 0 to 8640; 0 = native (the recording's own pixels).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(0..=ExportSettings::MAX_HEIGHT as i64))]
         height: Option<u32>,
-        #[arg(long)]
+        /// Frames per second, 1 to 120.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(ExportSettings::MIN_FPS as i64..=ExportSettings::MAX_FPS as i64))]
         fps: Option<u32>,
         #[arg(long, value_parser = ["studio", "social", "web", "web-low"])]
         quality: Option<String>,
         #[arg(long, value_parser = ["h264", "hevc", "prores"])]
         codec: Option<String>,
-        /// MP4: aim for a file of about this many MB.
-        #[arg(long)]
+        /// MP4: aim for a file of about this many MB (1 or more).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
         target_mb: Option<u32>,
     },
     /// Record the screen into a new .glide project.

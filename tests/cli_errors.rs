@@ -45,3 +45,32 @@ fn opening_an_unreadable_project_in_the_editor_fails_and_leaves_it_alone() {
     assert_eq!(std::fs::read(pkg.join("project.json")).unwrap(), truncated);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `glide export --synthetic` with one bad option: clap rejects it (exit 2)
+/// before any encoder is created.
+fn export_rejects(args: &[&str], names: &str) {
+    let run = Command::new(env!("CARGO_BIN_EXE_glide")).args(["export", "--synthetic"]).args(args).output().unwrap();
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(run.status.code(), Some(2), "{args:?} should be a usage error; stderr: {stderr}");
+    assert!(stderr.contains(names), "stderr should name {names}: {stderr}");
+}
+
+#[test]
+fn export_rejects_a_frame_rate_of_zero() {
+    export_rejects(&["--fps", "0"], "--fps");
+}
+
+#[test]
+fn export_rejects_a_frame_rate_above_120() {
+    export_rejects(&["--fps", "121"], "--fps");
+}
+
+#[test]
+fn export_rejects_a_height_above_8640() {
+    export_rejects(&["--height", "99999"], "--height");
+}
+
+#[test]
+fn export_rejects_a_target_size_of_zero() {
+    export_rejects(&["--target-mb", "0"], "--target-mb");
+}

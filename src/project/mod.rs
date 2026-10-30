@@ -90,7 +90,9 @@ impl Package {
         if let Some(found) = value.get("version").and_then(|v| v.as_u64()).filter(|v| *v > PROJECT_VERSION as u64) {
             return Err(NewerProject { found }.into());
         }
-        serde_json::from_value(value).with_context(|| format!("parsing {}", path.display()))
+        let mut project: Project = serde_json::from_value(value).with_context(|| format!("parsing {}", path.display()))?;
+        project.export = project.export.sanitized();
+        Ok(project)
     }
 
     /// A package with no `project.json` yet gets a fresh project. A `project.json` that exists but
@@ -216,6 +218,7 @@ pub fn new_package_path(dir: &Path, stamp: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use model::ExportSettings;
     use recording::{MouseEvent, MouseKind};
 
     #[test]
@@ -327,6 +330,16 @@ mod tests {
         fs::remove_dir_all(&pkg.root).unwrap();
     }
 
+    #[test]
+    fn export_settings_that_would_crash_the_encoder_are_clamped_on_load() {
+        let pkg = package("export-limits");
+        fs::write(pkg.project_file(), br#"{"export":{"fps":0,"height":999999,"target_mb":0}}"#).unwrap();
+        let (p, _) = pkg.load().unwrap();
+        assert!(p.export.fps >= ExportSettings::MIN_FPS);
+        assert_eq!(p.export.height, ExportSettings::MAX_HEIGHT);
+        assert_eq!(p.export.target_mb, None);
+        fs::remove_dir_all(&pkg.root).unwrap();
+    }
     #[test]
     fn the_current_version_still_loads() {
         let pkg = package("current");

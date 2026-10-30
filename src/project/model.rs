@@ -824,6 +824,21 @@ impl ExportSettings {
     pub const GIF_FPS: [u32; 6] = [50, 30, 25, 20, 15, 10];
     /// `height` for the recording's native resolution.
     pub const NATIVE: u32 = 0;
+    pub const MIN_FPS: u32 = 1;
+    pub const MAX_FPS: u32 = 120;
+    /// The tallest export Glide accepts (8K is 4320; this leaves room for portrait aspects).
+    pub const MAX_HEIGHT: u32 = 8640;
+    /// These settings with values the encoder can't take brought into range: a frame rate
+    /// outside 1..=120, a height above [`Self::MAX_HEIGHT`] and a target size of 0 MB. A
+    /// hand-edited `project.json` can hold any of them.
+    pub fn sanitized(self) -> Self {
+        ExportSettings {
+            fps: self.fps.clamp(Self::MIN_FPS, Self::MAX_FPS),
+            height: self.height.min(Self::MAX_HEIGHT),
+            target_mb: self.target_mb.filter(|mb| *mb > 0),
+            ..self
+        }
+    }
     pub const MP4_HEIGHTS: [u32; 5] = [Self::NATIVE, 2160, 1440, 1080, 720];
     pub const GIF_HEIGHTS: [u32; 3] = [480, 720, 1080];
 
@@ -951,6 +966,25 @@ mod tests {
         assert_eq!(ExportSettings { codec: Codec::Hevc, ..e }.codec_for(1280, 720), Codec::Hevc);
     }
 
+    #[test]
+    fn sanitized_export_settings_stay_inside_what_the_encoder_takes() {
+        let bad = ExportSettings { fps: 0, height: 999_999, target_mb: Some(0), ..Default::default() };
+        let ok = bad.sanitized();
+        assert_eq!((ok.fps, ok.height, ok.target_mb), (ExportSettings::MIN_FPS, ExportSettings::MAX_HEIGHT, None));
+        let high = ExportSettings { fps: 500, ..Default::default() }.sanitized();
+        assert_eq!(high.fps, ExportSettings::MAX_FPS);
+    }
+    #[test]
+    fn sanitized_export_settings_keep_valid_values() {
+        for fps in ExportSettings::MP4_FPS.into_iter().chain(ExportSettings::GIF_FPS) {
+            let e = ExportSettings { fps, height: ExportSettings::NATIVE, target_mb: Some(10), ..Default::default() };
+            assert_eq!(e.sanitized(), e, "fps {fps}");
+        }
+        for height in ExportSettings::MP4_HEIGHTS.into_iter().chain(ExportSettings::GIF_HEIGHTS) {
+            let e = ExportSettings { height, ..Default::default() };
+            assert_eq!(e.sanitized(), e, "height {height}");
+        }
+    }
     fn zoom(start: f64, end: f64) -> Zoom {
         Zoom { id: 1, start, end, ..Default::default() }
     }
