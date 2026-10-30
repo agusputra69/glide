@@ -253,8 +253,8 @@ impl LivePreview {
     /// audio it would record (`level`).
     pub fn start(source: &Source, max_px: u32, fps: u32, audio: bool, on_frame: impl Fn() + Send + Sync + 'static) -> Result<LivePreview> {
         match source {
-            Source::Camera { id } => return Self::start_camera(camera::find_camera(id.as_deref())?, max_px, on_frame),
-            Source::Device { id } => return Self::start_camera(camera::find_ios(id)?, max_px, on_frame),
+            Source::Camera { id } => return Self::start_camera(camera::find_camera(id.as_deref())?, max_px, false, on_frame),
+            Source::Device { id } => return Self::start_camera(camera::find_ios(id)?, max_px, true, on_frame),
             _ => {}
         }
         let displays = screen::displays()?;
@@ -338,14 +338,17 @@ impl LivePreview {
         }
     }
 
-    /// Preview a camera or iPhone through its own capture session (low preset).
-    fn start_camera(dev: Retained<AVCaptureDevice>, max_px: u32, on_frame: impl Fn() + Send + Sync + 'static) -> Result<LivePreview> {
+    /// Preview a camera (720p preset) or an iPhone/iPad (`ios`, the device's
+    /// own format) through its own capture session.
+    fn start_camera(dev: Retained<AVCaptureDevice>, max_px: u32, ios: bool, on_frame: impl Fn() + Send + Sync + 'static) -> Result<LivePreview> {
         // SAFETY: AVFoundation configuration on objects we own.
         unsafe {
             let name = dev.localizedName().to_string();
             let session = AVCaptureSession::new();
             session.beginConfiguration();
-            if session.canSetSessionPreset(AVCaptureSessionPreset1280x720) {
+            if ios {
+                camera::use_native_format(&session);
+            } else if session.canSetSessionPreset(AVCaptureSessionPreset1280x720) {
                 session.setSessionPreset(AVCaptureSessionPreset1280x720);
             }
             let input = AVCaptureDeviceInput::deviceInputWithDevice_error(&dev)

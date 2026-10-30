@@ -98,7 +98,7 @@ impl CameraRec {
     fn start_ios(id: &str, path: &std::path::Path, size: (usize, usize)) -> Result<Self> {
         let bitrate = ((size.0 * size.1) as f64 * 60.0 * 0.08) as u64;
         let spec = VideoSpec { width: size.0, height: size.1, fps: 60, codec: CapCodec::Hevc, bitrate: bitrate.max(4_000_000), quality: None, pixel_format: PIX_BGRA };
-        Self::start_spec(path, &spec, |shared| Camera::start_ios(id, shared))
+        Self::start_spec(path, &spec, |shared| Camera::start_ios(id, shared, size))
     }
 
     fn start_spec(path: &std::path::Path, spec: &VideoSpec, open: impl FnOnce(Arc<Shared>) -> Result<Camera>) -> Result<Self> {

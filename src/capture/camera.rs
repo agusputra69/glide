@@ -1,6 +1,7 @@
 //! Webcam capture (AVCaptureSession) and device enumeration.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
@@ -9,7 +10,7 @@ use objc2::runtime::ProtocolObject;
 use objc2::{AnyThread, DefinedClass, define_class, msg_send};
 use objc2_av_foundation::*;
 use objc2_core_media::CMSampleBuffer;
-use objc2_core_video::kCVPixelBufferPixelFormatTypeKey;
+use objc2_core_video::{CVPixelBufferGetHeight, CVPixelBufferGetWidth, kCVPixelBufferPixelFormatTypeKey};
 use objc2_foundation::{NSArray, NSObject, NSObjectProtocol};
 use dispatch2::DispatchQueue;
 
@@ -304,11 +305,43 @@ pub fn find_ios(id: &str) -> Result<Retained<AVCaptureDevice>> {
     wait_ios(id).ok_or_else(|| anyhow!("the iPhone/iPad is no longer connected"))
 }
 
+/// Consecutive frames of the wrong size tolerated before a device recording
+/// is stopped with an error (half a second at 60 fps).
+const SIZE_MISMATCH_LIMIT: u32 = 30;
+
+/// Does a delivered `frame` (width, height) match the `writer` size? The
+/// writer's sides are rounded to even, so an odd frame side is one pixel off
+/// (up or down) and still fits.
+pub fn frame_fits_writer(frame: (usize, usize), writer: (usize, usize)) -> bool {
+    frame.0 >= 2 && frame.1 >= 2 && frame.0.abs_diff(writer.0) <= 1 && frame.1.abs_diff(writer.1) <= 1
+}
+
+/// The length of the current run of wrong-sized frames after one more frame.
+fn mismatch_run(run: u32, fits: bool) -> u32 {
+    if fits { 0 } else { run.saturating_add(1) }
+}
+
+/// Use the device's own format instead of a preset that could change it. A
+/// preset on an iPhone's screen can switch the active format to another size.
+pub fn use_native_format(session: &AVCaptureSession) {
+    // SAFETY: AVFoundation calls on a session the caller owns.
+    unsafe {
+        if session.canSetSessionPreset(AVCaptureSessionPresetInputPriority) {
+            session.setSessionPreset(AVCaptureSessionPresetInputPriority);
+        }
+    }
+}
+
 pub struct CamIvars {
     shared: Arc<Shared>,
     /// Deliver frames as the sink's primary ("screen") video, for a
     /// camera-only recording.
     as_screen: bool,
+    /// The writer's size, for an iPhone/iPad screen. Frames of another size
+    /// are dropped, and the recording fails if that goes on.
+    writer_size: Option<(usize, usize)>,
+    /// Consecutive frames that did not fit `writer_size`.
+    mismatched: AtomicU32,
 }
 
 define_class!(
@@ -326,6 +359,20 @@ define_class!(
                 if let Some(pb) = sb.image_buffer() {
                     let pts = sb.presentation_time_stamp();
                     let iv = self.ivars();
+                    if let Some(writer) = iv.writer_size {
+                        let frame = (CVPixelBufferGetWidth(&pb), CVPixelBufferGetHeight(&pb));
+                        let run = mismatch_run(iv.mismatched.load(Ordering::Relaxed), frame_fits_writer(frame, writer));
+                        iv.mismatched.store(run, Ordering::Relaxed);
+                        if run > 0 {
+                            if run == SIZE_MISMATCH_LIMIT {
+                                iv.shared.fail(format!(
+                                    "The iPhone/iPad screen changed size (rotation?). It sends {}x{}, the recording is {}x{}. Stop and record again.",
+                                    frame.0, frame.1, writer.0, writer.1
+                                ));
+                            }
+                            return;
+                        }
+                    }
                     if iv.as_screen {
                         iv.shared.with(|s| s.push_screen(pts, pb));
                     } else {
@@ -352,22 +399,27 @@ impl Camera {
         Self::start_with(sel, shared, false)
     }
 
-    /// Record a connected iOS device's screen as the sink's main video.
-    pub fn start_ios(id: &str, shared: Arc<Shared>) -> Result<Self> {
-        Self::run(find_ios(id)?, shared, true, false)
+    /// Record a connected iOS device's screen as the sink's main video. The
+    /// writer is `size` pixels; the session keeps the device's own format.
+    pub fn start_ios(id: &str, shared: Arc<Shared>, size: (usize, usize)) -> Result<Self> {
+        Self::run(find_ios(id)?, shared, true, Some(size))
     }
 
     /// Like `start`; `as_screen` routes frames to the sink's main video.
     pub fn start_with(sel: Option<&str>, shared: Arc<Shared>, as_screen: bool) -> Result<Self> {
-        Self::run(find_camera(sel)?, shared, as_screen, true)
+        Self::run(find_camera(sel)?, shared, as_screen, None)
     }
 
-    fn run(dev: Retained<AVCaptureDevice>, shared: Arc<Shared>, as_screen: bool, preset_720: bool) -> Result<Self> {
+    /// `ios`: the writer size when `dev` is an iPhone/iPad screen. Webcams
+    /// get a 720p preset.
+    fn run(dev: Retained<AVCaptureDevice>, shared: Arc<Shared>, as_screen: bool, ios: Option<(usize, usize)>) -> Result<Self> {
         unsafe {
             let name = dev.localizedName().to_string();
             let session = AVCaptureSession::new();
             session.beginConfiguration();
-            if preset_720 && session.canSetSessionPreset(AVCaptureSessionPreset1280x720) {
+            if ios.is_some() {
+                use_native_format(&session);
+            } else if session.canSetSessionPreset(AVCaptureSessionPreset1280x720) {
                 session.setSessionPreset(AVCaptureSessionPreset1280x720);
             } else if session.canSetSessionPreset(AVCaptureSessionPresetHigh) {
                 session.setSessionPreset(AVCaptureSessionPresetHigh);
@@ -384,7 +436,7 @@ impl Camera {
                 num_i(PIX_BGRA as i64),
             )])));
             output.setAlwaysDiscardsLateVideoFrames(true);
-            let delegate = Self::make_delegate(shared, as_screen);
+            let delegate = Self::make_delegate(shared, as_screen, ios);
             let queue = DispatchQueue::new("rec.camera", None);
             output.setSampleBufferDelegate_queue(Some(ProtocolObject::from_ref(&*delegate)), Some(&queue));
             if !session.canAddOutput(&output) {
@@ -400,8 +452,8 @@ impl Camera {
         }
     }
 
-    fn make_delegate(shared: Arc<Shared>, as_screen: bool) -> Retained<CameraOutput> {
-        let this = CameraOutput::alloc().set_ivars(CamIvars { shared, as_screen });
+    fn make_delegate(shared: Arc<Shared>, as_screen: bool, writer_size: Option<(usize, usize)>) -> Retained<CameraOutput> {
+        let this = CameraOutput::alloc().set_ivars(CamIvars { shared, as_screen, writer_size, mismatched: AtomicU32::new(0) });
         unsafe { msg_send![super(this), init] }
     }
 
@@ -537,6 +589,37 @@ mod tests {
         let (v, tries, _, slept) = run(u32::MAX, Duration::from_millis(100));
         assert_eq!((v, tries), (None, 1));
         assert!(slept.is_empty());
+    }
+
+    #[test]
+    fn frame_fits_writer_accepts_the_same_size_and_one_extra_odd_pixel() {
+        assert!(frame_fits_writer((1170, 2532), (1170, 2532)));
+        assert!(frame_fits_writer((1171, 2532), (1170, 2532)));
+        assert!(frame_fits_writer((1170, 2533), (1170, 2532)));
+        // The writer rounds an odd side up.
+        assert!(frame_fits_writer((1171, 2533), (1172, 2534)));
+    }
+
+    #[test]
+    fn frame_fits_writer_rejects_a_rotated_or_other_size() {
+        assert!(!frame_fits_writer((2532, 1170), (1170, 2532)));
+        assert!(!frame_fits_writer((1280, 720), (1170, 2532)));
+        assert!(!frame_fits_writer((1172, 2532), (1170, 2532)));
+    }
+
+    #[test]
+    fn frame_fits_writer_rejects_empty_frames() {
+        assert!(!frame_fits_writer((0, 0), (0, 0)));
+        assert!(!frame_fits_writer((1, 1), (0, 0)));
+        assert!(!frame_fits_writer((0, 2532), (1170, 2532)));
+    }
+
+    #[test]
+    fn mismatch_run_counts_consecutive_bad_frames_and_resets_on_a_good_one() {
+        let run = (0..5).fold(0, |r, _| mismatch_run(r, false));
+        assert_eq!(run, 5);
+        assert_eq!(mismatch_run(run, true), 0);
+        assert_eq!(mismatch_run(u32::MAX, false), u32::MAX);
     }
 
     #[test]
