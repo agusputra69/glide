@@ -354,6 +354,7 @@ pub struct AudioStyle {
     pub mute_system: bool,
     /// Gentle denoise + level for the microphone track.
     pub enhance_mic: bool,
+    /// Background music: `assets/...` inside the package, or an absolute path in older projects.
     pub music: Option<String>,
     pub music_volume: f64,
     pub click_sounds: bool,

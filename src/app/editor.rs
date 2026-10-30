@@ -601,6 +601,9 @@ impl Editor {
             settings,
             output: output.clone(),
         };
+        if crate::export::audio::music_missing(Some(&self.package.root), &self.project.style.audio) {
+            self.status = Some("Music file missing: exporting without background music".into());
+        }
         let progress = Arc::new(AtomicU64::new(0f64.to_bits()));
         let cancel = Arc::new(AtomicBool::new(false));
         let (p2, c2) = (progress.clone(), cancel.clone());

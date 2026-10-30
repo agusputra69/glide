@@ -268,6 +268,19 @@ mod tests {
     }
 
     #[test]
+    fn importing_music_copies_it_into_assets_and_returns_a_package_relative_path() {
+        let pkg = package("music");
+        let src_dir = pkg.root.join("elsewhere");
+        fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join("song.MP3");
+        fs::write(&src, b"not really an mp3").unwrap();
+        let rel = pkg.import_asset(&src, "music").unwrap();
+        assert!(rel.starts_with("assets/music-") && rel.ends_with(".mp3"), "{rel}");
+        assert!(Path::new(&rel).is_relative());
+        assert_eq!(fs::read(pkg.root.join(&rel)).unwrap(), b"not really an mp3");
+        fs::remove_dir_all(&pkg.root).unwrap();
+    }
+    #[test]
     fn a_package_without_a_project_gets_a_fresh_one_and_no_copy() {
         let pkg = package("missing");
         let (p, _) = pkg.load().unwrap();

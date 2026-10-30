@@ -336,6 +336,9 @@ fn run_pass(job: &Job, out: &Path, bitrate: Option<u64>, progress: ProgressFn, c
     }
     let result = match s.format {
         ExportFormat::Mp4 => {
+            if audio::music_missing(dir, &job.project.style.audio) {
+                eprintln!("warning: the background music file is missing; exporting without it");
+            }
             let soundtrack = audio::mix(&job.project, &job.recording, dir, &scene.map);
             let mut writer = MovieWriter::create(
                 out,
