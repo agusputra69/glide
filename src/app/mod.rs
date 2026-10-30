@@ -2359,11 +2359,8 @@ mod tests {
 
     #[test]
     fn slot_retry_failed_waits_for_the_interval() {
-        let mut slot = TestSlot::default();
         let t0 = Instant::now();
-        slot.want = Some(1);
-        slot.failed = Some((1, "locked".into()));
-        slot.failed_at = Some(t0);
+        let mut slot = TestSlot { want: Some(1), failed: Some((1, "locked".into())), failed_at: Some(t0), ..Default::default() };
         assert!(!slot.retry_failed(t0 + Duration::from_secs(1), Duration::from_secs(2)));
         assert_eq!(slot.error(), Some("locked"));
         assert!(slot.retry_failed(t0 + Duration::from_secs(3), Duration::from_secs(2)));
@@ -2463,10 +2460,7 @@ mod tests {
 
     #[test]
     fn slot_changed_key_clears_the_failure() {
-        let mut slot = TestSlot::default();
-        slot.want = Some(1);
-        slot.failed = Some((1, "locked".into()));
-        slot.failed_at = Some(Instant::now());
+        let mut slot = TestSlot { want: Some(1), failed: Some((1, "locked".into())), failed_at: Some(Instant::now()), ..Default::default() };
         slot.update(Some(2), "test", always_fails);
         assert_eq!(slot.error(), None);
         assert!(slot.failed_at.is_none());
