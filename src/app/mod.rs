@@ -7,6 +7,7 @@ pub mod editor;
 pub mod maskwatch;
 pub mod home;
 pub mod hotkey;
+pub mod ioswatch;
 pub mod inspector;
 pub mod lifecycle;
 pub mod macos;
@@ -92,6 +93,9 @@ pub fn toolbar_drag(ui: &mut egui::Ui) {
     }
 }
 
+/// How long a failed iPhone preview waits before it is tried again.
+const IOS_RETRY: Duration = Duration::from_secs(2);
+
 struct Win {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
@@ -116,18 +120,24 @@ enum Which {
 /// Something started on a background thread for a key (a preview stream for
 /// a source, a meter for a microphone): what's wanted, what's running and
 /// what's starting. Changes settle before restarting; a key that failed
-/// isn't retried until the wanted key changes.
+/// isn't retried until the wanted key changes, or until `reset_failed` or
+/// `retry_failed` clears the failure.
 struct Slot<K, V> {
     want: Option<K>,
     want_since: Option<Instant>,
     running: Option<(K, V)>,
     starting: Option<(K, std::sync::mpsc::Receiver<Result<V, String>>)>,
     failed: Option<(K, String)>,
+    /// When `failed` was set.
+    failed_at: Option<Instant>,
+    /// The last failure text printed, so a retry that fails the same way
+    /// again isn't printed again.
+    logged: Option<String>,
 }
 
 impl<K, V> Default for Slot<K, V> {
     fn default() -> Self {
-        Slot { want: None, want_since: None, running: None, starting: None, failed: None }
+        Slot { want: None, want_since: None, running: None, starting: None, failed: None, failed_at: None, logged: None }
     }
 }
 
@@ -139,7 +149,7 @@ impl<K: Clone + PartialEq + Send + 'static, V: Send + 'static> Slot<K, V> {
         if want != self.want {
             self.want = want.clone();
             self.want_since = Some(Instant::now());
-            self.failed = None;
+            self.reset_failed();
         }
         if self.running.as_ref().is_some_and(|(k, _)| Some(k) != want.as_ref()) {
             let (_, v) = self.running.take().unwrap();
@@ -152,11 +162,18 @@ impl<K: Clone + PartialEq + Send + 'static, V: Send + 'static> Slot<K, V> {
             let k = k.clone();
             self.starting = None;
             match result {
-                Ok(v) if Some(&k) == want.as_ref() && self.running.is_none() => self.running = Some((k, v)),
+                Ok(v) if Some(&k) == want.as_ref() && self.running.is_none() => {
+                    self.logged = None;
+                    self.running = Some((k, v));
+                }
                 Ok(v) => drop(std::thread::spawn(move || drop(v))),
                 Err(e) => {
-                    eprintln!("glide: {name}: {e}");
+                    if self.logged.as_deref() != Some(e.as_str()) {
+                        eprintln!("glide: {name}: {e}");
+                        self.logged = Some(e.clone());
+                    }
                     self.failed = Some((k, e));
+                    self.failed_at = Some(Instant::now());
                 }
             }
         }
@@ -181,6 +198,24 @@ impl<K: Clone + PartialEq + Send + 'static, V: Send + 'static> Slot<K, V> {
 
     fn active(&self) -> bool {
         self.running.is_some() || self.starting.is_some()
+    }
+
+    /// Forget a failure so the wanted key starts again on the next `update`.
+    fn reset_failed(&mut self) {
+        self.failed = None;
+        self.failed_at = None;
+    }
+
+    /// Forget a failure that is at least `after` old at `now`. Returns
+    /// whether it did.
+    fn retry_failed(&mut self, now: Instant, after: Duration) -> bool {
+        match self.failed_at {
+            Some(at) if self.failed.is_some() && now.saturating_duration_since(at) >= after => {
+                self.reset_failed();
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Why the wanted key isn't running, if it failed.
@@ -1374,6 +1409,10 @@ impl App {
                 home::set_resize_note(note);
                 self.devices = home::Devices::load();
             }
+            home::Action::RefreshIos => {
+                self.devices.ios = crate::capture::camera::ios_devices().into_iter().map(|d| home::Device { id: d.id, name: d.name }).collect();
+                self.live.screen.reset_failed();
+            }
             home::Action::Back => self.close_project(),
             home::Action::None => {}
         }
@@ -1414,6 +1453,20 @@ impl App {
             self.settings.save();
         }
         let visible = self.setup_visible();
+        // A phone plugged in (or out) after launch changes the list; a
+        // failed iPhone preview is tried again every few seconds, since the
+        // phone may only have been locked or slow to wake.
+        let watch_ios = visible && self.settings.source == SourceKind::Device;
+        ioswatch::set_wanted(watch_ios);
+        if let Some(list) = ioswatch::take()
+            && ioswatch::differs(&list, &self.devices.ios)
+        {
+            self.devices.ios = list;
+            self.live.screen.reset_failed();
+        }
+        if watch_ios {
+            self.live.screen.retry_failed(Instant::now(), IOS_RETRY);
+        }
         let s = &self.settings;
         let screen = self.live_source().map(|src| {
             let audio = s.system_audio && !matches!(src, livecap::Source::Device { .. });
@@ -2182,4 +2235,92 @@ fn covered_note(s: &home::Settings) -> Option<String> {
     let target = if s.display == 0 { macos::main_display() } else { s.display };
     (fs != 0 && matches!(s.source, SourceKind::Display | SourceKind::Area) && fs == target)
         .then(|| "Glide is full screen on this display, so there's nothing else to show.\nExit full screen to see what you'll record.".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    type TestSlot = Slot<u8, u8>;
+
+    /// Let the wanted key's 300 ms settle time pass without sleeping.
+    fn settled(slot: &mut TestSlot) {
+        slot.want_since = Some(Instant::now() - Duration::from_secs(1));
+    }
+
+    /// Call `update` until `done` holds (the start runs on another thread).
+    fn pump(slot: &mut TestSlot, want: Option<u8>, start: fn(&u8) -> Result<u8, String>, done: impl Fn(&TestSlot) -> bool) {
+        for _ in 0..400 {
+            slot.update(want, "test", start);
+            if done(slot) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("slot did not settle");
+    }
+
+    static FAIL_CALLS: AtomicUsize = AtomicUsize::new(0);
+    fn always_fails(_: &u8) -> Result<u8, String> {
+        FAIL_CALLS.fetch_add(1, Ordering::SeqCst);
+        Err("no device".into())
+    }
+
+    #[test]
+    fn slot_does_not_retry_a_failed_key_by_itself() {
+        let mut slot = TestSlot::default();
+        slot.update(Some(1), "test", always_fails);
+        settled(&mut slot);
+        pump(&mut slot, Some(1), always_fails, |s| s.error().is_some());
+        assert_eq!(slot.error(), Some("no device"));
+        for _ in 0..20 {
+            slot.update(Some(1), "test", always_fails);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(FAIL_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    static RESET_CALLS: AtomicUsize = AtomicUsize::new(0);
+    fn fails_once(_: &u8) -> Result<u8, String> {
+        if RESET_CALLS.fetch_add(1, Ordering::SeqCst) == 0 { Err("first try".into()) } else { Ok(7) }
+    }
+
+    #[test]
+    fn slot_reset_failed_starts_the_same_key_again() {
+        let mut slot = TestSlot::default();
+        slot.update(Some(1), "test", fails_once);
+        settled(&mut slot);
+        pump(&mut slot, Some(1), fails_once, |s| s.error().is_some());
+        slot.reset_failed();
+        assert_eq!(slot.error(), None);
+        pump(&mut slot, Some(1), fails_once, |s| s.running.is_some());
+        assert_eq!(slot.running.as_ref().map(|(_, v)| *v), Some(7));
+        assert_eq!(RESET_CALLS.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn slot_retry_failed_waits_for_the_interval() {
+        let mut slot = TestSlot::default();
+        let t0 = Instant::now();
+        slot.want = Some(1);
+        slot.failed = Some((1, "locked".into()));
+        slot.failed_at = Some(t0);
+        assert!(!slot.retry_failed(t0 + Duration::from_secs(1), Duration::from_secs(2)));
+        assert_eq!(slot.error(), Some("locked"));
+        assert!(slot.retry_failed(t0 + Duration::from_secs(3), Duration::from_secs(2)));
+        assert_eq!(slot.error(), None);
+        assert!(!slot.retry_failed(t0 + Duration::from_secs(9), Duration::from_secs(2)), "nothing left to retry");
+    }
+
+    #[test]
+    fn slot_changed_key_clears_the_failure() {
+        let mut slot = TestSlot::default();
+        slot.want = Some(1);
+        slot.failed = Some((1, "locked".into()));
+        slot.failed_at = Some(Instant::now());
+        slot.update(Some(2), "test", always_fails);
+        assert_eq!(slot.error(), None);
+        assert!(slot.failed_at.is_none());
+    }
 }

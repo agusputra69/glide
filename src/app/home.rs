@@ -427,6 +427,9 @@ pub enum Action {
     ResizeWindow { id: u32, width: u32, height: u32 },
     /// Pick a window on screen.
     SelectWindow,
+    /// Ask again which iPhones and iPads are connected, and retry a preview
+    /// that failed.
+    RefreshIos,
     /// Remember the settings now (e.g. the camera bubble was restyled).
     SaveSettings,
 }
@@ -633,7 +636,7 @@ pub fn record_settings(ui: &mut Ui, s: &mut Settings, dev: &mut Devices, permiss
                 combo(ui, "ios", &mut s.ios_device, &devices, true);
             }
             if ui.small_button("Refresh").clicked() {
-                *dev = Devices::load();
+                action = Action::RefreshIos;
             }
         }
         SourceKind::Area => {
