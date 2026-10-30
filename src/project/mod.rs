@@ -93,30 +93,31 @@ impl Package {
         serde_json::from_value(value).with_context(|| format!("parsing {}", path.display()))
     }
 
-    /// A package with no `project.json` yet gets a fresh project. One that can't be read keeps a
-    /// copy of the file beside it before the fresh project replaces it on the next save, and one
-    /// from a newer Glide is an error, so neither is overwritten unseen.
+    /// A package with no `project.json` yet gets a fresh project. A `project.json` that exists but
+    /// can't be read is an error, and the file stays exactly as it is, so nothing saves a fresh
+    /// project over it. A copy goes beside it first and the error names that copy. One from a
+    /// newer Glide fails with [`NewerProject`].
     pub fn load(&self) -> Result<(Project, Recording)> {
         let rec = self.load_recording()?;
         if !self.project_file().exists() {
             return Ok((new_project(&self.name(), &rec), rec));
         }
-        let project = match self.load_project() {
-            Ok(p) => p,
-            Err(e) if e.is::<NewerProject>() => return Err(e),
+        match self.load_project() {
+            Ok(project) => Ok((project, rec)),
+            Err(e) if e.is::<NewerProject>() => Err(e),
             Err(e) => {
-                match self.keep_unreadable_project() {
-                    Some(copy) => eprintln!("{e:#}; kept a copy as {} and started a new project", copy.display()),
-                    None => eprintln!("{e:#}; started a new project"),
-                }
-                new_project(&self.name(), &rec)
+                let kept = match self.keep_unreadable_project() {
+                    Some(copy) => format!(" and kept a copy as {}", copy.display()),
+                    None => String::new(),
+                };
+                Err(anyhow::anyhow!("{} couldn't be read ({}). Glide left it as it is{kept}", self.project_file().display(), e.root_cause()))
             }
-        };
-        Ok((project, rec))
+        }
     }
 
     /// Copies `project.json` to `project.json.broken` (`-2`, `-3`… when that holds different
-    /// content) unless an identical copy is already there. Returns the copy's path.
+    /// content) unless an identical copy is already there. Returns the copy's path, or None when
+    /// no copy could be made.
     fn keep_unreadable_project(&self) -> Option<PathBuf> {
         let bytes = fs::read(self.project_file()).ok()?;
         for n in 1..100 {
@@ -273,16 +274,27 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_project_is_copied_before_it_is_replaced() {
+    fn a_truncated_project_fails_to_load_and_stays_as_it_is() {
         let pkg = package("corrupt");
         let broken = br#"{"name":"my edit","style":{"padding":"#;
         fs::write(pkg.project_file(), broken).unwrap();
-        let (p, _) = pkg.load().unwrap();
-        assert_eq!(p.timeline.slices.len(), 1, "falls back to a fresh project");
+        let err = pkg.load().unwrap_err();
+        assert_eq!(fs::read(pkg.project_file()).unwrap(), broken, "project.json is not rewritten");
         assert_eq!(fs::read(pkg.root.join("project.json.broken")).unwrap(), broken);
-        // The next save replaces project.json; the copy keeps the edit.
-        pkg.save_project(&p).unwrap();
-        assert_eq!(fs::read(pkg.root.join("project.json.broken")).unwrap(), broken);
+        let msg = format!("{err:#}");
+        assert!(msg.contains("project.json.broken"), "the message names the copy: {msg}");
+        assert!(err.downcast_ref::<NewerProject>().is_none());
+        fs::remove_dir_all(&pkg.root).unwrap();
+    }
+
+    #[test]
+    fn a_project_with_an_unknown_variant_fails_to_load_and_stays_as_it_is() {
+        let pkg = package("unknown-variant");
+        let unknown = br#"{"style":{"background":{"type":"video"}}}"#;
+        fs::write(pkg.project_file(), unknown).unwrap();
+        let err = pkg.load().unwrap_err();
+        assert_eq!(fs::read(pkg.project_file()).unwrap(), unknown);
+        assert!(format!("{err:#}").contains("project.json"), "{err:#}");
         fs::remove_dir_all(&pkg.root).unwrap();
     }
 
@@ -290,14 +302,15 @@ mod tests {
     fn loading_the_same_unreadable_project_again_adds_no_second_copy() {
         let pkg = package("corrupt-twice");
         fs::write(pkg.project_file(), b"not json").unwrap();
-        pkg.load().unwrap();
-        pkg.load().unwrap();
+        assert!(pkg.load().is_err());
+        assert!(pkg.load().is_err());
         assert!(!pkg.root.join("project.json.broken-2").exists());
         // A different broken file doesn't overwrite the first copy.
         fs::write(pkg.project_file(), b"also not json").unwrap();
-        pkg.load().unwrap();
+        assert!(pkg.load().is_err());
         assert_eq!(fs::read(pkg.root.join("project.json.broken")).unwrap(), b"not json");
         assert_eq!(fs::read(pkg.root.join("project.json.broken-2")).unwrap(), b"also not json");
+        assert_eq!(fs::read(pkg.project_file()).unwrap(), b"also not json");
         fs::remove_dir_all(&pkg.root).unwrap();
     }
 
