@@ -162,3 +162,14 @@ fn fit_to_size_ends_at_the_final_path_with_no_first_pass_left() {
     assert_eq!(names(&dir), ["Clip.glide", "fit.mp4"]);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_250_byte_output_name_exports() {
+    let (dir, pkg) = package("long-name", 1.0, 320, 200);
+    let out = dir.join("out");
+    let file = format!("{}.mp4", "a".repeat(246));
+    let job = job(&pkg, mp4_settings(), out.join(&file));
+    export::run(&job, &mut |_| {}, &AtomicBool::new(false)).unwrap();
+    assert_eq!(names(&out), [file]);
+    assert_no_leftovers(&out);
+}

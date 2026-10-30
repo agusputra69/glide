@@ -517,14 +517,23 @@ pub fn unique_path(path: &Path, exists: impl Fn(&Path) -> bool) -> PathBuf {
     let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
     (2u64..).map(|n| path.with_file_name(format!("{stem} {n}{ext}"))).find(|p| !exists(p)).expect("an unused name")
 }
+/// The longest partial file name we build. File names top out at 255 bytes; this leaves room
+/// for the `.sb-…` files AVFoundation adds beside the temp file.
+const PARTIAL_NAME_MAX: usize = 255 - 16;
 /// A hidden, run-unique file beside `output` that an export is written to before it is renamed
-/// into place. It keeps the real extension because the movie writer picks the container from it.
+/// into place. It keeps the real extension because the movie writer picks the container from it, and a long
+/// stem is cut so the name stays within `PARTIAL_NAME_MAX`.
 fn partial_path(output: &Path) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let stem = output.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "export".into());
     let ext = output.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    output.with_file_name(format!(".{stem}.partial-{}-{n}{ext}", std::process::id()))
+    let suffix = format!(".partial-{}-{n}{ext}", std::process::id());
+    let mut keep = PARTIAL_NAME_MAX.saturating_sub(1 + suffix.len()).min(stem.len());
+    while !stem.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    output.with_file_name(format!(".{}{suffix}", &stem[..keep]))
 }
 /// Remove an unfinished export and the `.sb-…` files AVFoundation can leave beside it.
 fn discard_partial(tmp: &Path) {
@@ -591,6 +600,29 @@ mod tests {
         assert_eq!(std::fs::read(&out).unwrap(), b"new");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn a_long_output_name_gets_a_partial_name_that_fits() {
+        let dir = scratch("long-partial");
+        let out = dir.join(format!("{}.mp4", "a".repeat(246)));
+        let p = partial_path(&out);
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.len() <= 239, "{}", name.len());
+        assert!(name.starts_with('.') && name.ends_with(".mp4"), "{name}");
+        std::fs::File::create(&p).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn a_multibyte_stem_is_cut_on_a_character_boundary() {
+        let out = PathBuf::from(format!("/m/{}.mp4", "é".repeat(125)));
+        let name = partial_path(&out).file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.len() <= 239, "{}", name.len());
+        assert!(name.ends_with(".mp4"));
+    }
+    #[test]
+    fn partials_of_a_long_name_stay_distinct() {
+        let out = PathBuf::from(format!("/m/{}.mp4", "a".repeat(250)));
+        assert_ne!(partial_path(&out), partial_path(&out));
     }
     #[test]
     fn a_free_name_is_used_as_it_is() {
