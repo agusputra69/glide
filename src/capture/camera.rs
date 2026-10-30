@@ -155,8 +155,8 @@ fn wait_ios(id: &str) -> Option<Retained<AVCaptureDevice>> {
     );
     let ms = started.elapsed().as_millis();
     match &found {
-        Some(_) => eprintln!("glide: ios discovery: {id} found after {tries} tries ({ms} ms)"),
-        None => eprintln!("glide: ios discovery: {id} not found after {tries} tries ({ms} ms); listed: [{}]", names(&last)),
+        Some(_) => crate::diag::note(&format!("glide: ios discovery: {id} found after {tries} tries ({ms} ms)")),
+        None => crate::diag::note(&format!("glide: ios discovery: {id} not found after {tries} tries ({ms} ms); listed: [{}]", names(&last))),
     }
     found
 }
@@ -172,7 +172,7 @@ pub fn ios_devices_waiting(deadline: Duration) -> Vec<Device> {
     let started = Instant::now();
     let (list, tries, _) = poll_until(deadline, IOS_POLL, || Some(ios_devices()).filter(|l| !l.is_empty()), std::thread::sleep);
     let list = list.unwrap_or_default();
-    eprintln!("glide: ios discovery: {} listed after {tries} tries ({} ms): [{}]", list.len(), started.elapsed().as_millis(), names(&list));
+    crate::diag::note(&format!("glide: ios discovery: {} listed after {tries} tries ({} ms): [{}]", list.len(), started.elapsed().as_millis(), names(&list)));
     list
 }
 
@@ -427,10 +427,12 @@ define_class!(
                         iv.mismatched.store(run, Ordering::Relaxed);
                         if run > 0 {
                             if run == SIZE_MISMATCH_LIMIT {
-                                iv.shared.fail(format!(
+                                let msg = format!(
                                     "The iPhone/iPad screen changed size (rotation?). It sends {}x{}, the recording is {}x{}. Stop and record again.",
                                     frame.0, frame.1, writer.0, writer.1
-                                ));
+                                );
+                                crate::diag::note(&format!("glide: ios recording: {msg}"));
+                                iv.shared.fail(msg);
                             }
                             return;
                         }
@@ -504,7 +506,7 @@ impl Camera {
             let watch = ios.is_some().then(|| {
                 let shared = shared.clone();
                 SessionWatch::new(&session, &dev, IOS_DISCONNECTED, Arc::new(move |m| {
-                    eprintln!("glide: ios recording: {m}");
+                    crate::diag::note(&format!("glide: ios recording: {m}"));
                     shared.fail(m);
                 }))
             });

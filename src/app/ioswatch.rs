@@ -49,7 +49,7 @@ fn poll() {
             crate::capture::camera::ios_devices().into_iter().map(|d| Device { id: d.id, name: d.name }).collect()
         });
         if last.as_deref().is_none_or(|l| differs(l, &list)) {
-            eprintln!("glide: ios devices: [{}]", list.iter().map(|d| format!("{} ({})", d.name, d.id)).collect::<Vec<_>>().join(", "));
+            crate::diag::note(&format!("glide: ios devices: [{}]", list.iter().map(|d| format!("{} ({})", d.name, d.id)).collect::<Vec<_>>().join(", ")));
             *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(list.clone());
             last = Some(list);
             super::wake();

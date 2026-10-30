@@ -247,8 +247,8 @@ pub fn request_all(screen: bool, mic: bool, camera: bool, wait: Duration) {
         let Some(rx) = rx else { continue };
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         match rx.recv_timeout(left) {
-            Ok(g) => eprintln!("{name}: {}", if g { "granted" } else { "denied" }),
-            Err(_) => eprintln!("{name}: prompt still pending (answer it on screen)"),
+            Ok(g) => crate::diag::note(&format!("{name}: {}", if g { "granted" } else { "denied" })),
+            Err(_) => crate::diag::note(&format!("{name}: prompt still pending (answer it on screen)")),
         }
     }
 }

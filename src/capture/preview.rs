@@ -395,7 +395,7 @@ impl LivePreview {
             let watch = ios.then(|| {
                 let (slot, name) = (runtime_error.clone(), name.clone());
                 camera::SessionWatch::new(&session, &dev, camera::IOS_DISCONNECTED, Arc::new(move |m| {
-                    eprintln!("glide: ios preview {name}: {m}");
+                    crate::diag::note(&format!("glide: ios preview {name}: {m}"));
                     slot.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(m);
                     wake();
                 }))

@@ -200,7 +200,7 @@ impl<K: Clone + PartialEq + Send + 'static, V: Send + 'static> Slot<K, V> {
     /// failure said the same.
     fn fail(&mut self, k: K, name: &str, e: String) {
         if self.logged.as_deref() != Some(e.as_str()) {
-            eprintln!("glide: {name}: {e}");
+            crate::diag::note(&format!("glide: {name}: {e}"));
             self.logged = Some(e.clone());
         }
         self.failed = Some((k, e));
@@ -767,7 +767,8 @@ impl App {
         let opts = self.recorder_options();
         // An iPhone's screen has one client at a time: let the preview's
         // session finish stopping before the recorder opens the device.
-        if matches!(opts.target, Target::Device { .. }) {
+        let device = matches!(opts.target, Target::Device { .. });
+        if device {
             self.live.screen.stop_and_join();
             self.live.tex = None;
         }
@@ -779,6 +780,9 @@ impl App {
                 }
             }
             Err(e) => {
+                if device {
+                    crate::diag::note(&format!("glide: ios recording: could not start: {e:#}"));
+                }
                 self.recording = None;
                 self.error = Some(format!("Couldn't start recording: {e:#}"));
                 self.close_bar();
