@@ -13,6 +13,7 @@ use anyhow::Result;
 use crate::engine::geom::Rect;
 use crate::media::FrameSource;
 use crate::project::model::{Mask, MaskKind};
+use crate::project::recording::{MouseEvent, MouseKind};
 
 /// Time between compared frames.
 pub const SAMPLE_MS: f64 = 100.0;
@@ -44,7 +45,7 @@ pub fn hides(kind: MaskKind) -> bool {
 
 /// The masked region scaled to SIDE×SIDE brightness values.
 pub struct Patch {
-    luma: Vec<f32>,
+    pub luma: Vec<f32>,
 }
 
 impl Patch {
@@ -207,6 +208,92 @@ pub fn scan(video: &Path, masks: &[Mask], cache: &mut Cache, cancelled: &dyn Fn(
     Ok(out)
 }
 
+/// Minimum cell difference (0..255 luma) to count as changed.
+const MIN_CELL_DIFF: f32 = 12.0;
+/// Minimum changed cells in a 64x64 grid to count as user interaction (at least 16 cells).
+const MIN_CHANGED_CELLS: usize = 16;
+/// Sampling interval for visual motion detection.
+pub const ACTIVITY_SAMPLE_MS: f64 = 250.0;
+/// Minimum gap between distinct activity triggers.
+pub const ACTIVITY_MIN_GAP_MS: f64 = 1500.0;
+
+/// Detect activity points from a sequence of (timestamp_ms, Patch).
+pub fn detect_activity_from_patches(
+    patches: &[(f64, Patch)],
+    screen_w: u32,
+    screen_h: u32,
+) -> Vec<MouseEvent> {
+    let mut events = vec![];
+    let mut last_event_t = -ACTIVITY_MIN_GAP_MS;
+    for window in patches.windows(2) {
+        let (_t0, p0) = &window[0];
+        let (t1, p1) = &window[1];
+        let mut changed_count = 0usize;
+        let mut sum_diff = 0.0f64;
+        let mut sum_x = 0.0f64;
+        let mut sum_y = 0.0f64;
+        for cy in 0..SIDE {
+            for cx in 0..SIDE {
+                let idx = cy * SIDE + cx;
+                let diff = (p1.luma[idx] - p0.luma[idx]).abs() as f64;
+                if diff >= MIN_CELL_DIFF as f64 {
+                    changed_count += 1;
+                    sum_diff += diff;
+                    sum_x += cx as f64 * diff;
+                    sum_y += cy as f64 * diff;
+                }
+            }
+        }
+        if changed_count >= MIN_CHANGED_CELLS
+            && sum_diff > 0.0
+            && *t1 - last_event_t >= ACTIVITY_MIN_GAP_MS
+        {
+            let avg_x = sum_x / sum_diff;
+            let avg_y = sum_y / sum_diff;
+            let norm_x = ((avg_x + 0.5) / SIDE as f64).clamp(0.0, 1.0);
+            let norm_y = ((avg_y + 0.5) / SIDE as f64).clamp(0.0, 1.0);
+            events.push(MouseEvent {
+                t: *t1,
+                x: (norm_x * screen_w as f64).round(),
+                y: (norm_y * screen_h as f64).round(),
+                kind: MouseKind::Down,
+                button: 0,
+                cursor: 0,
+            });
+            last_event_t = *t1;
+        }
+    }
+    events
+}
+
+/// Scan a video file for visual activity (e.g. on iOS screen recordings where no mouse events exist),
+/// returning synthetic MouseEvent::Down events at interaction timestamps and locations.
+pub fn scan_activity(
+    video: &Path,
+    screen_w: u32,
+    screen_h: u32,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<MouseEvent>> {
+    let mut src = FrameSource::open(video)?;
+    let duration = src.duration_ms();
+    let rect = Rect::new(0.0, 0.0, 1.0, 1.0);
+    let mut samples = vec![];
+    let mut t = 0.0;
+    while t <= duration {
+        if cancelled() {
+            return Ok(vec![]);
+        }
+        let patch = objc2::rc::autoreleasepool(|_| {
+            src.frame_at(t).and_then(|f| f.with_bgra(|v| Patch::from_bgra(v.bgra, v.width, v.height, v.stride, rect)))
+        });
+        if let Some(p) = patch {
+            samples.push((t, p));
+        }
+        t += ACTIVITY_SAMPLE_MS;
+    }
+    Ok(detect_activity_from_patches(&samples, screen_w, screen_h))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +356,35 @@ mod tests {
     #[test]
     fn only_hiding_masks_are_checked() {
         assert!(hides(MaskKind::Blur) && hides(MaskKind::Pixelate) && !hides(MaskKind::Highlight));
+    }
+
+    #[test]
+    fn detect_activity_finds_changed_regions() {
+        let p0 = Patch { luma: vec![50.0; SIDE * SIDE] };
+        let mut p1_luma = vec![50.0; SIDE * SIDE];
+        // Change a 10x10 block in the bottom right corner (x in 45..55, y in 45..55)
+        for y in 45..55 {
+            for x in 45..55 {
+                p1_luma[y * SIDE + x] = 200.0;
+            }
+        }
+        let p1 = Patch { luma: p1_luma };
+        let patches = vec![(0.0, p0), (500.0, p1)];
+        let events = detect_activity_from_patches(&patches, 1000, 2000);
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert_eq!(e.t, 500.0);
+        assert_eq!(e.kind, MouseKind::Down);
+        assert!((e.x - 773.0).abs() < 50.0);
+        assert!((e.y - 1547.0).abs() < 100.0);
+    }
+
+    #[test]
+    fn detect_activity_ignores_static_frames() {
+        let p0 = Patch { luma: vec![50.0; SIDE * SIDE] };
+        let p1 = Patch { luma: vec![50.0; SIDE * SIDE] };
+        let patches = vec![(0.0, p0), (500.0, p1)];
+        let events = detect_activity_from_patches(&patches, 1000, 2000);
+        assert!(events.is_empty());
     }
 }

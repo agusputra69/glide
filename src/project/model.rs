@@ -354,6 +354,7 @@ pub struct AudioStyle {
     pub mute_system: bool,
     /// Gentle denoise + level for the microphone track.
     pub enhance_mic: bool,
+    /// Background music: `assets/...` inside the package, or an absolute path in older projects.
     pub music: Option<String>,
     pub music_volume: f64,
     pub click_sounds: bool,
@@ -599,6 +600,11 @@ impl Default for LayoutRange {
         LayoutRange { id: 0, start: 0.0, end: 0.0, kind: LayoutKind::Both, camera_size: None, camera_position: None }
     }
 }
+impl LayoutRange {
+    /// Length of a layout added at the playhead.
+    pub const DEFAULT_LEN_MS: f64 = 3000.0;
+    pub const MIN_LEN_MS: f64 = 300.0;
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -639,6 +645,8 @@ impl Mask {
     /// Fade in/out time at the ends of the range.
     pub const FADE_MS: f64 = 150.0;
     pub const MIN_LEN_MS: f64 = 300.0;
+    /// Length of a mask added at the playhead.
+    pub const DEFAULT_LEN_MS: f64 = 3000.0;
 
     pub fn default_amount(kind: MaskKind) -> f64 {
         match kind {
@@ -682,6 +690,15 @@ impl Default for VoiceOver {
     }
 }
 
+/// Where a `len` ms range added at `at` goes in a `duration` ms recording:
+/// inside it, and at least `min` long (it starts earlier when `at` is too
+/// close to the end). A recording shorter than `len` gets all of it.
+pub fn span_at(at: f64, len: f64, min: f64, duration: f64) -> (f64, f64) {
+    let duration = duration.max(0.0);
+    let (len, min) = (len.min(duration), min.min(duration));
+    let start = at.clamp(0.0, (duration - min).max(0.0));
+    (start, (start + len).min(duration))
+}
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Timeline {
@@ -704,12 +721,24 @@ impl Timeline {
     /// `Zoom::MIN_LEN_MS` (it starts earlier when `at` is too close to the end).
     pub fn add_zoom(&mut self, at: f64, scale: f64, duration: f64) -> u64 {
         let id = self.new_id();
-        let start = at.clamp(0.0, (duration - Zoom::MIN_LEN_MS).max(0.0));
-        let end = (start + Zoom::DEFAULT_LEN_MS).min(duration).max(start);
+        let (start, end) = span_at(at, Zoom::DEFAULT_LEN_MS, Zoom::MIN_LEN_MS, duration);
         self.zooms.push(Zoom { id, start, end, scale, ..Default::default() });
         id
     }
-
+    /// Add a mask at source time `at`, placed like `add_zoom`.
+    pub fn add_mask(&mut self, at: f64, duration: f64) -> u64 {
+        let id = self.new_id();
+        let (start, end) = span_at(at, Mask::DEFAULT_LEN_MS, Mask::MIN_LEN_MS, duration);
+        self.masks.push(Mask { id, start, end, ..Default::default() });
+        id
+    }
+    /// Add a camera-only layout at source time `at`, placed like `add_zoom`.
+    pub fn add_layout(&mut self, at: f64, duration: f64) -> u64 {
+        let id = self.new_id();
+        let (start, end) = span_at(at, LayoutRange::DEFAULT_LEN_MS, LayoutRange::MIN_LEN_MS, duration);
+        self.layouts.push(LayoutRange { id, start, end, kind: LayoutKind::CameraOnly, ..Default::default() });
+        id
+    }
     /// Split zoom `id` at source time `t` into two that share its settings.
     /// Each half keeps at least `Zoom::MIN_LEN_MS`. Returns the id of the new
     /// second half, or None when `t` is too close to an end (or no such zoom).
@@ -819,11 +848,58 @@ impl Default for ExportSettings {
     }
 }
 
+/// The last settings used for each export format, so switching MP4 to GIF
+/// and back brings each side back as it was left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FormatMemory {
+    mp4: ExportSettings,
+    gif: ExportSettings,
+}
+impl FormatMemory {
+    /// Remember `current` for its format; the other starts at its defaults.
+    pub fn new(current: ExportSettings) -> Self {
+        let mut m = FormatMemory { mp4: ExportSettings::default(), gif: ExportSettings::gif_default() };
+        m.remember(current);
+        m
+    }
+    pub fn remember(&mut self, s: ExportSettings) {
+        match s.format {
+            ExportFormat::Mp4 => self.mp4 = s,
+            ExportFormat::Gif => self.gif = s,
+        }
+    }
+    pub fn recall(&self, format: ExportFormat) -> ExportSettings {
+        match format {
+            ExportFormat::Mp4 => self.mp4,
+            ExportFormat::Gif => self.gif,
+        }
+    }
+    /// Leave the format of `leaving` (remembering it) for `to`.
+    pub fn switch(&mut self, leaving: ExportSettings, to: ExportFormat) -> ExportSettings {
+        self.remember(leaving);
+        self.recall(to)
+    }
+}
 impl ExportSettings {
     pub const MP4_FPS: [u32; 7] = [60, 50, 30, 25, 24, 20, 10];
     pub const GIF_FPS: [u32; 6] = [50, 30, 25, 20, 15, 10];
     /// `height` for the recording's native resolution.
     pub const NATIVE: u32 = 0;
+    pub const MIN_FPS: u32 = 1;
+    pub const MAX_FPS: u32 = 120;
+    /// The tallest export Glide accepts (8K is 4320; this leaves room for portrait aspects).
+    pub const MAX_HEIGHT: u32 = 8640;
+    /// These settings with values the encoder can't take brought into range: a frame rate
+    /// outside 1..=120, a height above [`Self::MAX_HEIGHT`] and a target size of 0 MB. A
+    /// hand-edited `project.json` can hold any of them.
+    pub fn sanitized(self) -> Self {
+        ExportSettings {
+            fps: self.fps.clamp(Self::MIN_FPS, Self::MAX_FPS),
+            height: self.height.min(Self::MAX_HEIGHT),
+            target_mb: self.target_mb.filter(|mb| *mb > 0),
+            ..self
+        }
+    }
     pub const MP4_HEIGHTS: [u32; 5] = [Self::NATIVE, 2160, 1440, 1080, 720];
     pub const GIF_HEIGHTS: [u32; 3] = [480, 720, 1080];
 
@@ -951,6 +1027,25 @@ mod tests {
         assert_eq!(ExportSettings { codec: Codec::Hevc, ..e }.codec_for(1280, 720), Codec::Hevc);
     }
 
+    #[test]
+    fn sanitized_export_settings_stay_inside_what_the_encoder_takes() {
+        let bad = ExportSettings { fps: 0, height: 999_999, target_mb: Some(0), ..Default::default() };
+        let ok = bad.sanitized();
+        assert_eq!((ok.fps, ok.height, ok.target_mb), (ExportSettings::MIN_FPS, ExportSettings::MAX_HEIGHT, None));
+        let high = ExportSettings { fps: 500, ..Default::default() }.sanitized();
+        assert_eq!(high.fps, ExportSettings::MAX_FPS);
+    }
+    #[test]
+    fn sanitized_export_settings_keep_valid_values() {
+        for fps in ExportSettings::MP4_FPS.into_iter().chain(ExportSettings::GIF_FPS) {
+            let e = ExportSettings { fps, height: ExportSettings::NATIVE, target_mb: Some(10), ..Default::default() };
+            assert_eq!(e.sanitized(), e, "fps {fps}");
+        }
+        for height in ExportSettings::MP4_HEIGHTS.into_iter().chain(ExportSettings::GIF_HEIGHTS) {
+            let e = ExportSettings { height, ..Default::default() };
+            assert_eq!(e.sanitized(), e, "height {height}");
+        }
+    }
     fn zoom(start: f64, end: f64) -> Zoom {
         Zoom { id: 1, start, end, ..Default::default() }
     }
@@ -998,6 +1093,64 @@ mod tests {
         assert_eq!(z.start, 0.0);
     }
 
+    #[test]
+    fn switching_format_and_back_keeps_each_sides_settings() {
+        let mp4 = ExportSettings { height: 1080, fps: 30, quality: Quality::Web, codec: Codec::Hevc, target_mb: Some(20), ..Default::default() };
+        let mut mem = FormatMemory::new(mp4);
+        let gif = mem.switch(mp4, ExportFormat::Gif);
+        assert_eq!(gif, ExportSettings::gif_default());
+        let edited = ExportSettings { fps: 10, height: 360, gif_loop: false, ..gif };
+        assert_eq!(mem.switch(edited, ExportFormat::Mp4), mp4);
+        assert_eq!(mem.switch(mp4, ExportFormat::Gif), edited);
+    }
+    #[test]
+    fn a_new_memory_offers_the_other_formats_defaults() {
+        let mem = FormatMemory::new(ExportSettings::default());
+        assert_eq!(mem.recall(ExportFormat::Gif), ExportSettings::gif_default());
+        let gif = ExportSettings { fps: 10, ..ExportSettings::gif_default() };
+        let mem = FormatMemory::new(gif);
+        assert_eq!(mem.recall(ExportFormat::Gif), gif);
+        assert_eq!(mem.recall(ExportFormat::Mp4), ExportSettings::default());
+    }
+    #[test]
+    fn span_at_start_of_the_recording() {
+        assert_eq!(span_at(0.0, 3000.0, 300.0, 10_000.0), (0.0, 3000.0));
+    }
+    #[test]
+    fn span_at_the_middle() {
+        assert_eq!(span_at(4000.0, 3000.0, 300.0, 10_000.0), (4000.0, 7000.0));
+    }
+    #[test]
+    fn span_at_exactly_the_end() {
+        assert_eq!(span_at(10_000.0, 3000.0, 300.0, 10_000.0), (9700.0, 10_000.0));
+    }
+    #[test]
+    fn span_past_the_end_is_pulled_back() {
+        assert_eq!(span_at(15_000.0, 3000.0, 300.0, 10_000.0), (9700.0, 10_000.0));
+    }
+    #[test]
+    fn span_before_the_start_is_pushed_forward() {
+        assert_eq!(span_at(-50.0, 3000.0, 300.0, 10_000.0), (0.0, 3000.0));
+    }
+    #[test]
+    fn a_recording_shorter_than_the_default_length_gets_the_whole_recording() {
+        assert_eq!(span_at(0.0, 3000.0, 300.0, 1000.0), (0.0, 1000.0));
+        assert_eq!(span_at(100.0, 3000.0, 300.0, 200.0), (0.0, 200.0));
+    }
+    #[test]
+    fn added_masks_and_layouts_are_never_zero_length_at_the_end() {
+        let mut tl = Timeline::default();
+        let m = tl.add_mask(10_000.0, 10_000.0);
+        let l = tl.add_layout(15_000.0, 10_000.0);
+        let mask = *tl.masks.iter().find(|x| x.id == m).unwrap();
+        let layout = *tl.layouts.iter().find(|x| x.id == l).unwrap();
+        assert_eq!((mask.start, mask.end), (10_000.0 - Mask::MIN_LEN_MS, 10_000.0));
+        assert_eq!((layout.start, layout.end), (10_000.0 - LayoutRange::MIN_LEN_MS, 10_000.0));
+        assert_eq!(layout.kind, LayoutKind::CameraOnly);
+        let m = tl.add_mask(2000.0, 10_000.0);
+        let mask = *tl.masks.iter().find(|x| x.id == m).unwrap();
+        assert_eq!((mask.start, mask.end), (2000.0, 5000.0));
+    }
     #[test]
     fn added_zooms_never_run_past_the_end_or_below_the_minimum() {
         let mut tl = Timeline::default();

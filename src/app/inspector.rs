@@ -501,7 +501,10 @@ fn audio(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
             if ui.button("Choose…").clicked()
                 && let Some(f) = rfd::FileDialog::new().add_filter("Audio", &["mp3", "m4a", "wav", "aac", "aiff"]).pick_file()
             {
-                a.music = Some(f.to_string_lossy().into_owned());
+                match ed.package.import_asset(&f, "music") {
+                    Ok(rel) => a.music = Some(rel),
+                    Err(e) => ed.status = Some(format!("Couldn't use that music file: {e:#}")),
+                }
             }
             if a.music.is_some() && ui.button("Remove").clicked() {
                 a.music = None;
@@ -509,6 +512,9 @@ fn audio(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
         });
         if let Some(m) = &a.music {
             caption(ui, &std::path::Path::new(m).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+            if crate::export::audio::music_missing(Some(&ed.package.root), a) {
+                ui.label(RichText::new("Music file missing").size(theme::SECONDARY).color(Color32::from_rgb(255, 69, 58)));
+            }
             slider(ui, "Music volume", &mut a.music_volume, 0.0..=1.0, "");
         }
     });
@@ -588,7 +594,18 @@ fn animation(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
     });
     section(ui, "Automatic zooms", |ui| {
         slider(ui, "Default zoom", &mut d.style.default_zoom, 1.2..=4.0, "×");
-        if ui.button("Regenerate from clicks").clicked() {
+        let btn_label = if ed.rec.meta.kind == crate::project::recording::SourceKind::Device {
+            "Generate from screen activity"
+        } else {
+            "Regenerate from clicks"
+        };
+        if ui.button(btn_label).clicked() {
+            if ed.rec.meta.kind == crate::project::recording::SourceKind::Device && ed.rec.mouse.is_empty() {
+                let video_path = ed.package.rec(&ed.rec.meta.screen.file);
+                if let Ok(events) = crate::exposure::scan_activity(&video_path, ed.rec.meta.screen.width, ed.rec.meta.screen.height, &|| false) {
+                    ed.rec.mouse = events;
+                }
+            }
             let events = crate::engine::events::Events::new(ed.rec.mouse.clone());
             let zooms = crate::engine::zoom::auto_zooms(&events.downs, ed.rec.meta.duration_ms, d.style.default_zoom, &mut d.timeline);
             d.timeline.zooms = zooms;
