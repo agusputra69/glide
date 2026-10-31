@@ -594,7 +594,18 @@ fn animation(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
     });
     section(ui, "Automatic zooms", |ui| {
         slider(ui, "Default zoom", &mut d.style.default_zoom, 1.2..=4.0, "×");
-        if ui.button("Regenerate from clicks").clicked() {
+        let btn_label = if ed.rec.meta.kind == crate::project::recording::SourceKind::Device {
+            "Generate from screen activity"
+        } else {
+            "Regenerate from clicks"
+        };
+        if ui.button(btn_label).clicked() {
+            if ed.rec.meta.kind == crate::project::recording::SourceKind::Device && ed.rec.mouse.is_empty() {
+                let video_path = ed.package.rec(&ed.rec.meta.screen.file);
+                if let Ok(events) = crate::exposure::scan_activity(&video_path, ed.rec.meta.screen.width, ed.rec.meta.screen.height, &|| false) {
+                    ed.rec.mouse = events;
+                }
+            }
             let events = crate::engine::events::Events::new(ed.rec.mouse.clone());
             let zooms = crate::engine::zoom::auto_zooms(&events.downs, ed.rec.meta.duration_ms, d.style.default_zoom, &mut d.timeline);
             d.timeline.zooms = zooms;

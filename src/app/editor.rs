@@ -169,7 +169,7 @@ impl Editor {
         if !package.project_file().exists() {
             package.save_project(&project)?;
         }
-        let preview = Preview::new(gpu, path.to_path_buf(), &project, &rec);
+        let mut preview = Preview::new(gpu, path.to_path_buf(), &project, &rec);
         let mask_watch = super::maskwatch::MaskWatch::new(package.rec(&rec.meta.screen.file));
         let mut audio = AudioPreview::new();
         audio.rebuild_now(&project, &rec, path);
@@ -180,6 +180,18 @@ impl Editor {
                 let p = TrackPeaks { system: crate::export::audio::track_peak(&rd, &meta.system_audio), mic: crate::export::audio::track_peak(&rd, &meta.mic) };
                 *peaks.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
             });
+        }
+        let mut rec = rec;
+        let mut project = project;
+        if rec.meta.kind == crate::project::recording::SourceKind::Device
+            && project.timeline.zooms.is_empty()
+            && let Ok(events) = crate::exposure::scan_activity(&package.rec(&rec.meta.screen.file), rec.meta.screen.width, rec.meta.screen.height, &|| false)
+            && !events.is_empty()
+        {
+            let ev = crate::engine::events::Events::new(events.clone());
+            project.timeline.zooms = crate::engine::zoom::auto_zooms(&ev.downs, rec.meta.duration_ms, project.style.default_zoom, &mut project.timeline);
+            rec.mouse = events;
+            preview.set_project(&project, &rec);
         }
         let export_memory = FormatMemory::new(project.export);
         Ok(Editor {
@@ -731,6 +743,31 @@ impl Editor {
         if cmd && pressed(egui::Key::S) {
             self.save();
         }
+        if cmd && pressed(egui::Key::C)
+            && let Some(Ok((path, _))) = &self.export.result
+        {
+            super::macos::copy_file(path);
+            self.status = Some(format!("Copied {} to clipboard", path.file_name().unwrap_or_default().to_string_lossy()));
+        }
+        if !cmd && pressed(egui::Key::J) {
+            self.seek(self.playhead - if shift { 1000.0 } else { 500.0 });
+        }
+        if !cmd && pressed(egui::Key::K) {
+            self.toggle_play();
+        }
+        if let Selection::Zoom(id) = self.selection {
+            if !cmd && pressed(egui::Key::Num1) {
+                self.edit(|p| if let Some(z) = p.timeline.zooms.iter_mut().find(|z| z.id == id) { z.scale = 1.5; });
+            } else if !cmd && pressed(egui::Key::Num2) {
+                self.edit(|p| if let Some(z) = p.timeline.zooms.iter_mut().find(|z| z.id == id) { z.scale = 2.0; });
+            } else if !cmd && pressed(egui::Key::Num3) {
+                self.edit(|p| if let Some(z) = p.timeline.zooms.iter_mut().find(|z| z.id == id) { z.scale = 3.0; });
+            } else if !cmd && pressed(egui::Key::I) {
+                self.edit(|p| if let Some(z) = p.timeline.zooms.iter_mut().find(|z| z.id == id) { z.instant = !z.instant; });
+            } else if !cmd && pressed(egui::Key::D) {
+                self.edit(|p| if let Some(z) = p.timeline.zooms.iter_mut().find(|z| z.id == id) { z.disabled = !z.disabled; });
+            }
+        }
         if pressed(egui::Key::Delete) || pressed(egui::Key::Backspace) {
             self.delete_selection();
         }
@@ -1104,8 +1141,11 @@ impl Editor {
                                 if ui.button("Show in Finder").clicked() {
                                     super::macos::reveal(&path);
                                 }
-                                if ui.button("Copy").on_hover_text("Copy the file to the clipboard").clicked() {
+                                let copied = self.status.as_deref().is_some_and(|s| s.starts_with("Copied"));
+                                let copy_label = if copied { "✓ Copied" } else { "Copy" };
+                                if ui.button(copy_label).on_hover_text("Copy the file to the clipboard (Cmd+C)").clicked() {
                                     super::macos::copy_file(&path);
+                                    self.status = Some(format!("Copied {} to clipboard", path.file_name().unwrap_or_default().to_string_lossy()));
                                 }
                                 if ui.button("Open").clicked() {
                                     super::macos::open(&path);

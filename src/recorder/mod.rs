@@ -584,6 +584,14 @@ impl Recorder {
             app_name: self.app_name.clone(),
             created_ms: now_ms(),
         };
+        let mut mouse = mouse;
+        if meta.kind == project::recording::SourceKind::Device
+            && mouse.is_empty()
+            && let Ok(events) = crate::exposure::scan_activity(&pkg.rec(&meta.screen.file), meta.screen.width, meta.screen.height, &|| false)
+            && !events.is_empty()
+        {
+            mouse = events;
+        }
         project::write_json(&pkg.rec("meta.json"), &meta)?;
         project::write_json(&pkg.rec("mouse.json"), &mouse)?;
         project::write_json(&pkg.rec("keys.json"), &keys)?;
