@@ -107,10 +107,10 @@ pub struct Focus {
 /// Focus for an auto zoom: the latest click/activity cluster that started.
 pub fn auto_focus(z: &Zoom, events: &Events, sizes: &Sizes, t: f64) -> Option<Vec2> {
     let mut inside = Events::range(&events.all, z.start, z.end).to_vec();
-    if inside.is_empty() {
-        if let Some(e) = Events::last_at(&events.all, z.start).or(events.all.first()) {
-            inside.push(*e);
-        }
+    if inside.is_empty()
+        && let Some(e) = Events::last_at(&events.all, z.start).or(events.all.first())
+    {
+        inside.push(*e);
     }
     let fill = sizes.content.div(sizes.window);
     let area = sizes.crop.size().div(v2(fill.y, fill.x)) / z.scale.max(0.01);

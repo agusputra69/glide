@@ -117,6 +117,12 @@ enum Which {
     Overlay(u32),
 }
 
+struct Starting<K, V> {
+    key: K,
+    rx: std::sync::mpsc::Receiver<Result<V, String>>,
+    handle: std::thread::JoinHandle<()>,
+}
+
 /// Something started on a background thread for a key (a preview stream for
 /// a source, a meter for a microphone): what's wanted, what's running and
 /// what's starting. Changes settle before restarting; a key that failed
@@ -126,7 +132,7 @@ struct Slot<K, V> {
     want: Option<K>,
     want_since: Option<Instant>,
     running: Option<(K, V)>,
-    starting: Option<(K, std::sync::mpsc::Receiver<Result<V, String>>)>,
+    starting: Option<Starting<K, V>>,
     failed: Option<(K, String)>,
     /// When `failed` was set.
     failed_at: Option<Instant>,
@@ -159,18 +165,18 @@ impl<K: Clone + PartialEq + Send + 'static, V: Send + 'static> Slot<K, V> {
             self.drop_later(v);
             stopped = true;
         }
-        if let Some((k, rx)) = &self.starting
-            && let Ok(result) = rx.try_recv()
+        if let Some(s) = &self.starting
+            && let Ok(result) = s.rx.try_recv()
         {
-            let k = k.clone();
-            self.starting = None;
+            let s = self.starting.take().unwrap();
+            let _ = s.handle.join();
             match result {
-                Ok(v) if Some(&k) == want.as_ref() && self.running.is_none() => {
+                Ok(v) if Some(&s.key) == want.as_ref() && self.running.is_none() => {
                     self.logged = None;
-                    self.running = Some((k, v));
+                    self.running = Some((s.key, v));
                 }
                 Ok(v) => self.drop_later(v),
-                Err(e) => self.fail(k, name, e),
+                Err(e) => self.fail(s.key, name, e),
             }
         }
         // Wait for edits (an area being typed in) to settle before starting.
@@ -183,11 +189,11 @@ impl<K: Clone + PartialEq + Send + 'static, V: Send + 'static> Slot<K, V> {
         {
             let (tx, rx) = std::sync::mpsc::channel();
             let key = k.clone();
-            std::thread::spawn(move || {
+            let handle = std::thread::spawn(move || {
                 let _ = tx.send(objc2::rc::autoreleasepool(|_| start(&key)));
                 wake();
             });
-            self.starting = Some((k, rx));
+            self.starting = Some(Starting { key: k, rx, handle });
         }
         stopped
     }
@@ -226,13 +232,15 @@ impl<K: Clone + PartialEq + Send + 'static, V: Send + 'static> Slot<K, V> {
 
     /// Stop everything now, on this thread, and return only when it has
     /// stopped: the running value is dropped here, a value still starting is
-    /// waited for (up to 3 s) and dropped, and earlier background drops are
-    /// joined. For a single-client device that must be free before something
-    /// else opens it.
+    /// joined and dropped, and earlier background drops are joined. For a
+    /// single-client device that must be free before something else opens it.
     fn stop_and_join(&mut self) {
         drop(self.running.take());
-        if let Some((_, rx)) = self.starting.take() {
-            drop(rx.recv_timeout(Duration::from_secs(3)));
+        if let Some(s) = self.starting.take() {
+            let _ = s.handle.join();
+            if let Ok(Ok(v)) = s.rx.try_recv() {
+                drop(v);
+            }
         }
         for h in self.dropping.drain(..) {
             let _ = h.join();
@@ -2212,10 +2220,10 @@ impl ApplicationHandler for App {
             ed.cancel_export();
             ed.save();
         }
-        if let Some(Recording { rec: Some(r), .. }) = self.recording.take() {
-            if let Err(e) = objc2::rc::autoreleasepool(|_| r.stop()) {
-                eprintln!("glide: saving the recording on quit failed: {e:#}");
-            }
+        if let Some(Recording { rec: Some(r), .. }) = self.recording.take()
+            && let Err(e) = objc2::rc::autoreleasepool(|_| r.stop())
+        {
+            eprintln!("glide: saving the recording on quit failed: {e:#}");
         }
         let deadline = Instant::now() + Duration::from_secs(60);
         while self.winding_down() && Instant::now() < deadline {
@@ -2448,6 +2456,24 @@ mod tests {
         slot.stop_and_join();
         assert!(slot.running.is_none() && slot.starting.is_none() && slot.want.is_none());
         assert!(STARTING_DROPPED.load(Ordering::SeqCst), "the late value should be dropped before returning");
+    }
+
+    static STARTING_FINISHED: AtomicBool = AtomicBool::new(false);
+    #[test]
+    fn slot_stop_and_join_joins_startup_thread_completely() {
+        let mut slot: Slot<u8, u8> = Slot::default();
+        let start: fn(&u8) -> Result<u8, String> = |_| {
+            std::thread::sleep(Duration::from_millis(50));
+            STARTING_FINISHED.store(true, Ordering::SeqCst);
+            Err("failed".into())
+        };
+        slot.update(Some(1), "test", start);
+        slot.want_since = Some(Instant::now() - Duration::from_secs(1));
+        slot.update(Some(1), "test", start);
+        assert!(slot.starting.is_some());
+        slot.stop_and_join();
+        assert!(STARTING_FINISHED.load(Ordering::SeqCst), "startup thread must be joined before returning");
+        assert!(slot.starting.is_none());
     }
 
     #[test]

@@ -176,19 +176,23 @@ pub fn ios_devices_waiting(deadline: Duration) -> Vec<Device> {
     list
 }
 
-static IOS_FRAME_DIMS: Mutex<Option<(u32, u32)>> = Mutex::new(None);
+static IOS_FRAME_DIMS: Mutex<Option<(String, (u32, u32))>> = Mutex::new(None);
 
 /// Record dimensions from an observed iOS screen preview frame.
-pub fn record_ios_frame_dimensions(w: u32, h: u32) {
+pub fn record_ios_frame_dimensions(id: &str, w: u32, h: u32) {
     if w >= 2 && h >= 2 {
         let mut g = IOS_FRAME_DIMS.lock().unwrap_or_else(|e| e.into_inner());
-        *g = Some((w, h));
+        *g = Some((id.to_string(), (w, h)));
     }
 }
 
-/// The latest dimensions seen from an iOS screen preview frame, if any.
-pub fn last_ios_frame_dimensions() -> Option<(u32, u32)> {
-    *IOS_FRAME_DIMS.lock().unwrap_or_else(|e| e.into_inner())
+/// The latest dimensions seen from an iOS screen preview frame for `id`, if any.
+pub fn last_ios_frame_dimensions(id: &str) -> Option<(u32, u32)> {
+    let g = IOS_FRAME_DIMS.lock().unwrap_or_else(|e| e.into_inner());
+    match g.as_ref() {
+        Some((dev_id, dims)) if dev_id == id => Some(*dims),
+        _ => None,
+    }
 }
 
 /// Clear the recorded iOS screen frame dimensions (for tests).
@@ -244,7 +248,7 @@ pub fn device_dimensions(dev: &AVCaptureDevice) -> Option<(u32, u32)> {
 
 /// An iOS device's current screen size in pixels.
 pub fn ios_dimensions(id: &str) -> Option<(u32, u32)> {
-    if let Some((w, h)) = last_ios_frame_dimensions() {
+    if let Some((w, h)) = last_ios_frame_dimensions(id) {
         crate::diag::note(&format!("glide: ios dimensions for {id}: {w}x{h} (from live preview frame)"));
         return Some((w, h));
     }
@@ -795,25 +799,40 @@ mod tests {
         assert_eq!((v, tries), (None, 1));
     }
 
+    static TEST_MUTEX: Mutex<()> = Mutex::new(());
+
     #[test]
     fn record_and_retrieve_ios_frame_dimensions() {
+        let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         clear_ios_frame_dimensions();
-        assert_eq!(last_ios_frame_dimensions(), None);
-        record_ios_frame_dimensions(1170, 2532);
-        assert_eq!(last_ios_frame_dimensions(), Some((1170, 2532)));
+        assert_eq!(last_ios_frame_dimensions("mock-id"), None);
+        record_ios_frame_dimensions("mock-id", 1170, 2532);
+        assert_eq!(last_ios_frame_dimensions("mock-id"), Some((1170, 2532)));
         // Degenerate dimensions are ignored
-        record_ios_frame_dimensions(0, 0);
-        record_ios_frame_dimensions(1, 100);
-        assert_eq!(last_ios_frame_dimensions(), Some((1170, 2532)));
+        record_ios_frame_dimensions("mock-id", 0, 0);
+        record_ios_frame_dimensions("mock-id", 1, 100);
+        assert_eq!(last_ios_frame_dimensions("mock-id"), Some((1170, 2532)));
+        // Dimensions for another device ID are not returned
+        assert_eq!(last_ios_frame_dimensions("other-id"), None);
         clear_ios_frame_dimensions();
-        assert_eq!(last_ios_frame_dimensions(), None);
+        assert_eq!(last_ios_frame_dimensions("mock-id"), None);
     }
 
     #[test]
     fn ios_dimensions_uses_recorded_frame_dimensions() {
+        let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         clear_ios_frame_dimensions();
-        record_ios_frame_dimensions(1179, 2556);
+        record_ios_frame_dimensions("mock-id", 1179, 2556);
         assert_eq!(ios_dimensions("mock-id"), Some((1179, 2556)));
+        clear_ios_frame_dimensions();
+    }
+
+    #[test]
+    fn ios_dimensions_ignores_dimensions_from_another_device() {
+        let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        clear_ios_frame_dimensions();
+        record_ios_frame_dimensions("phone-1", 1170, 2532);
+        assert_eq!(last_ios_frame_dimensions("phone-2"), None);
         clear_ios_frame_dimensions();
     }
 }

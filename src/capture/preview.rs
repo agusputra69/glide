@@ -64,8 +64,8 @@ pub struct Ivars {
     target: Arc<AtomicU64>,
     /// Lanczos scaling (screens only; None = frames as captured).
     scaler: Option<Mutex<Scaler>>,
-    /// Whether this output previews an iOS device screen.
-    ios: bool,
+    /// Device ID if this output previews an iOS device screen.
+    ios_device_id: Option<String>,
 }
 
 define_class!(
@@ -100,9 +100,9 @@ define_class!(
 );
 
 impl PreviewOutput {
-    fn create(latest: Arc<Mutex<Option<Buffer>>>, level: Arc<AtomicU32>, target: Arc<AtomicU64>, scale: bool, ios: bool, on_frame: Callback) -> Retained<Self> {
+    fn create(latest: Arc<Mutex<Option<Buffer>>>, level: Arc<AtomicU32>, target: Arc<AtomicU64>, scale: bool, ios_device_id: Option<String>, on_frame: Callback) -> Retained<Self> {
         let scaler = scale.then(Scaler::new).flatten().map(Mutex::new);
-        let this = Self::alloc().set_ivars(Ivars { latest, on_frame, level, target, scaler, ios });
+        let this = Self::alloc().set_ivars(Ivars { latest, on_frame, level, target, scaler, ios_device_id });
         unsafe { msg_send![super(this), init] }
     }
 
@@ -114,8 +114,8 @@ impl PreviewOutput {
         if fw < 2 || fh < 2 {
             return;
         }
-        if iv.ios {
-            camera::record_ios_frame_dimensions(fw as u32, fh as u32);
+        if let Some(id) = &iv.ios_device_id {
+            camera::record_ios_frame_dimensions(id, fw as u32, fh as u32);
         }
         let t = iv.target.load(Ordering::Relaxed);
         let (w, h) = target_size(fw, fh, ((t >> 32) as u32, t as u32));
@@ -262,11 +262,11 @@ impl LivePreview {
     /// audio it would record (`level`).
     pub fn start(source: &Source, max_px: u32, fps: u32, audio: bool, on_frame: impl Fn() + Send + Sync + 'static) -> Result<LivePreview> {
         match source {
-            Source::Camera { id } => return Self::start_camera(camera::find_camera(id.as_deref())?, max_px, false, on_frame),
+            Source::Camera { id } => return Self::start_camera(camera::find_camera(id.as_deref())?, max_px, None, on_frame),
             Source::Device { id } => {
                 // The one place that may ask, on the Slot's background thread.
                 super::tcc::require_camera(std::time::Duration::from_secs(60))?;
-                return Self::start_camera(camera::find_ios(id)?, max_px, true, on_frame);
+                return Self::start_camera(camera::find_ios(id)?, max_px, Some(id.clone()), on_frame);
             }
             _ => {}
         }
@@ -334,7 +334,7 @@ impl LivePreview {
             let latest = Arc::new(Mutex::new(None));
             let level = Arc::new(AtomicU32::new(0));
             let target = Arc::new(AtomicU64::new(0));
-            let output = PreviewOutput::create(latest.clone(), level.clone(), target.clone(), max_px == 0, false, Box::new(on_frame));
+            let output = PreviewOutput::create(latest.clone(), level.clone(), target.clone(), max_px == 0, None, Box::new(on_frame));
             let stream = SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &conf, None);
             let queue = DispatchQueue::new("glide.preview", None);
             let proto: &ProtocolObject<dyn SCStreamOutput> = ProtocolObject::from_ref(&*output);
@@ -351,11 +351,12 @@ impl LivePreview {
         }
     }
 
-    /// Preview a camera (720p preset) or an iPhone/iPad (`ios`, the device's
+    /// Preview a camera (720p preset) or an iPhone/iPad (`ios_id`, the device's
     /// own format) through its own capture session.
-    fn start_camera(dev: Retained<AVCaptureDevice>, max_px: u32, ios: bool, on_frame: impl Fn() + Send + Sync + 'static) -> Result<LivePreview> {
+    fn start_camera(dev: Retained<AVCaptureDevice>, max_px: u32, ios_id: Option<String>, on_frame: impl Fn() + Send + Sync + 'static) -> Result<LivePreview> {
         // SAFETY: AVFoundation configuration on objects we own.
         unsafe {
+            let ios = ios_id.is_some();
             let name = dev.localizedName().to_string();
             let session = AVCaptureSession::new();
             session.beginConfiguration();
@@ -372,6 +373,7 @@ impl LivePreview {
             session.addInput(&input);
             let out = AVCaptureVideoDataOutput::new();
             // Small frames: the output scales (keeping the aspect ratio).
+            // For iOS devices, keep preview frames native so delivered sizes match recording.
             let dims = dev.activeFormat().formatDescription();
             let mut d = objc2_core_media::CMVideoFormatDescriptionGetDimensions(&dims);
             if (d.width == 0 || d.height == 0)
@@ -382,7 +384,7 @@ impl LivePreview {
             let mut settings = vec![
                 (crate::util::cf_ns(kCVPixelBufferPixelFormatTypeKey), crate::util::num_i(crate::util::PIX_BGRA as i64)),
             ];
-            if d.width > 0 && d.height > 0 {
+            if !ios && d.width > 0 && d.height > 0 {
                 let (w, h) = camera_output_size((d.width, d.height), max_px);
                 settings.push((crate::util::cf_ns(kCVPixelBufferWidthKey), crate::util::num_i(w)));
                 settings.push((crate::util::cf_ns(kCVPixelBufferHeightKey), crate::util::num_i(h)));
@@ -394,7 +396,7 @@ impl LivePreview {
             // Also called when the session reports an error, so the UI looks.
             let on_frame = Arc::new(on_frame);
             let wake = on_frame.clone();
-            let output = PreviewOutput::create(latest.clone(), Arc::new(AtomicU32::new(0)), target.clone(), false, ios, Box::new(move || on_frame()));
+            let output = PreviewOutput::create(latest.clone(), Arc::new(AtomicU32::new(0)), target.clone(), ios, ios_id, Box::new(move || on_frame()));
             let queue = DispatchQueue::new("glide.preview.camera", None);
             out.setSampleBufferDelegate_queue(Some(ProtocolObject::from_ref(&*output)), Some(&queue));
             if !session.canAddOutput(&out) {
