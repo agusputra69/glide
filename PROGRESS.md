@@ -67,7 +67,7 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 
 `scripts/selftest.sh --screen` (2026-10-12): 13/13 pass.
 
-- `cargo test` (243): engine, project, presets, renderer helpers, masks,
+- `cargo test` (245): engine, project, presets, renderer helpers, masks,
   device frames, typing detection, caption editing, transcription chunking,
   Whisper transcription of synthesized speech,
   hotkeys, timeline clamping and cuts, voice isolation, masked-content

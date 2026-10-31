@@ -1,6 +1,6 @@
 //! Webcam capture (AVCaptureSession) and device enumeration.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -176,14 +176,89 @@ pub fn ios_devices_waiting(deadline: Duration) -> Vec<Device> {
     list
 }
 
-/// An iOS device's current screen size in pixels.
-pub fn ios_dimensions(id: &str) -> Option<(u32, u32)> {
-    let dev = wait_ios(id)?;
+static IOS_FRAME_DIMS: Mutex<Option<(u32, u32)>> = Mutex::new(None);
+
+/// Record dimensions from an observed iOS screen preview frame.
+pub fn record_ios_frame_dimensions(w: u32, h: u32) {
+    if w >= 2 && h >= 2 {
+        let mut g = IOS_FRAME_DIMS.lock().unwrap_or_else(|e| e.into_inner());
+        *g = Some((w, h));
+    }
+}
+
+/// The latest dimensions seen from an iOS screen preview frame, if any.
+pub fn last_ios_frame_dimensions() -> Option<(u32, u32)> {
+    *IOS_FRAME_DIMS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Clear the recorded iOS screen frame dimensions (for tests).
+pub fn clear_ios_frame_dimensions() {
+    let mut g = IOS_FRAME_DIMS.lock().unwrap_or_else(|e| e.into_inner());
+    *g = None;
+}
+
+/// Screen dimensions in pixels for a device, checking its active format,
+/// then its supported formats, then its input ports.
+pub fn device_dimensions(dev: &AVCaptureDevice) -> Option<(u32, u32)> {
     unsafe {
         let desc = dev.activeFormat().formatDescription();
         let dims = objc2_core_media::CMVideoFormatDescriptionGetDimensions(&desc);
-        (dims.width > 0 && dims.height > 0).then_some((dims.width as u32, dims.height as u32))
+        if dims.width > 0 && dims.height > 0 {
+            return Some((dims.width as u32, dims.height as u32));
+        }
+
+        let mut best: Option<(Retained<AVCaptureDeviceFormat>, (u32, u32))> = None;
+        for f in dev.formats().iter() {
+            let desc = f.formatDescription();
+            let dims = objc2_core_media::CMVideoFormatDescriptionGetDimensions(&desc);
+            if dims.width > 0 && dims.height > 0 {
+                let (w, h) = (dims.width as u32, dims.height as u32);
+                match &best {
+                    Some((_, (bw, bh))) if (w as u64 * h as u64) <= (*bw as u64 * *bh as u64) => {}
+                    _ => best = Some((f.clone(), (w, h))),
+                }
+            }
+        }
+        if let Some((f, (w, h))) = best {
+            if dev.lockForConfiguration().is_ok() {
+                dev.setActiveFormat(&f);
+                dev.unlockForConfiguration();
+            }
+            return Some((w, h));
+        }
+
+        if let Ok(input) = AVCaptureDeviceInput::deviceInputWithDevice_error(dev) {
+            for port in input.ports().iter() {
+                if let Some(desc) = port.formatDescription() {
+                    let dims = objc2_core_media::CMVideoFormatDescriptionGetDimensions(&desc);
+                    if dims.width > 0 && dims.height > 0 {
+                        return Some((dims.width as u32, dims.height as u32));
+                    }
+                }
+            }
+        }
+
+        None
     }
+}
+
+/// An iOS device's current screen size in pixels.
+pub fn ios_dimensions(id: &str) -> Option<(u32, u32)> {
+    if let Some((w, h)) = last_ios_frame_dimensions() {
+        crate::diag::note(&format!("glide: ios dimensions for {id}: {w}x{h} (from live preview frame)"));
+        return Some((w, h));
+    }
+
+    let dev = wait_ios(id)?;
+
+    if let Some((w, h)) = device_dimensions(&dev) {
+        crate::diag::note(&format!("glide: ios dimensions for {id}: {w}x{h} (from device formats/ports)"));
+        return Some((w, h));
+    }
+
+    let fallback = (1170, 2532);
+    crate::diag::note(&format!("glide: ios dimensions for {id}: fallback {fallback:?}"));
+    Some(fallback)
 }
 
 pub fn cameras() -> Vec<Device> {
@@ -483,8 +558,19 @@ impl Camera {
             let name = dev.localizedName().to_string();
             let session = AVCaptureSession::new();
             session.beginConfiguration();
-            if ios.is_some() {
+            if let Some(target_size) = ios {
                 use_native_format(&session);
+                for f in dev.formats().iter() {
+                    let desc = f.formatDescription();
+                    let dims = objc2_core_media::CMVideoFormatDescriptionGetDimensions(&desc);
+                    if dims.width == target_size.0 as i32 && dims.height == target_size.1 as i32 {
+                        if dev.lockForConfiguration().is_ok() {
+                            dev.setActiveFormat(&f);
+                            dev.unlockForConfiguration();
+                        }
+                        break;
+                    }
+                }
             } else if session.canSetSessionPreset(AVCaptureSessionPreset1280x720) {
                 session.setSessionPreset(AVCaptureSessionPreset1280x720);
             } else if session.canSetSessionPreset(AVCaptureSessionPresetHigh) {
@@ -707,5 +793,27 @@ mod tests {
     fn poll_until_with_a_zero_step_does_not_loop() {
         let (v, tries, _) = poll_until(IOS_WAIT, Duration::ZERO, || None::<u8>, |_| {});
         assert_eq!((v, tries), (None, 1));
+    }
+
+    #[test]
+    fn record_and_retrieve_ios_frame_dimensions() {
+        clear_ios_frame_dimensions();
+        assert_eq!(last_ios_frame_dimensions(), None);
+        record_ios_frame_dimensions(1170, 2532);
+        assert_eq!(last_ios_frame_dimensions(), Some((1170, 2532)));
+        // Degenerate dimensions are ignored
+        record_ios_frame_dimensions(0, 0);
+        record_ios_frame_dimensions(1, 100);
+        assert_eq!(last_ios_frame_dimensions(), Some((1170, 2532)));
+        clear_ios_frame_dimensions();
+        assert_eq!(last_ios_frame_dimensions(), None);
+    }
+
+    #[test]
+    fn ios_dimensions_uses_recorded_frame_dimensions() {
+        clear_ios_frame_dimensions();
+        record_ios_frame_dimensions(1179, 2556);
+        assert_eq!(ios_dimensions("mock-id"), Some((1179, 2556)));
+        clear_ios_frame_dimensions();
     }
 }

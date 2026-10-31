@@ -64,6 +64,8 @@ pub struct Ivars {
     target: Arc<AtomicU64>,
     /// Lanczos scaling (screens only; None = frames as captured).
     scaler: Option<Mutex<Scaler>>,
+    /// Whether this output previews an iOS device screen.
+    ios: bool,
 }
 
 define_class!(
@@ -98,9 +100,9 @@ define_class!(
 );
 
 impl PreviewOutput {
-    fn create(latest: Arc<Mutex<Option<Buffer>>>, level: Arc<AtomicU32>, target: Arc<AtomicU64>, scale: bool, on_frame: Callback) -> Retained<Self> {
+    fn create(latest: Arc<Mutex<Option<Buffer>>>, level: Arc<AtomicU32>, target: Arc<AtomicU64>, scale: bool, ios: bool, on_frame: Callback) -> Retained<Self> {
         let scaler = scale.then(Scaler::new).flatten().map(Mutex::new);
-        let this = Self::alloc().set_ivars(Ivars { latest, on_frame, level, target, scaler });
+        let this = Self::alloc().set_ivars(Ivars { latest, on_frame, level, target, scaler, ios });
         unsafe { msg_send![super(this), init] }
     }
 
@@ -111,6 +113,9 @@ impl PreviewOutput {
         let (fw, fh) = (CVPixelBufferGetWidth(&pb), CVPixelBufferGetHeight(&pb));
         if fw < 2 || fh < 2 {
             return;
+        }
+        if iv.ios {
+            camera::record_ios_frame_dimensions(fw as u32, fh as u32);
         }
         let t = iv.target.load(Ordering::Relaxed);
         let (w, h) = target_size(fw, fh, ((t >> 32) as u32, t as u32));
@@ -329,7 +334,7 @@ impl LivePreview {
             let latest = Arc::new(Mutex::new(None));
             let level = Arc::new(AtomicU32::new(0));
             let target = Arc::new(AtomicU64::new(0));
-            let output = PreviewOutput::create(latest.clone(), level.clone(), target.clone(), max_px == 0, Box::new(on_frame));
+            let output = PreviewOutput::create(latest.clone(), level.clone(), target.clone(), max_px == 0, false, Box::new(on_frame));
             let stream = SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &conf, None);
             let queue = DispatchQueue::new("glide.preview", None);
             let proto: &ProtocolObject<dyn SCStreamOutput> = ProtocolObject::from_ref(&*output);
@@ -368,20 +373,28 @@ impl LivePreview {
             let out = AVCaptureVideoDataOutput::new();
             // Small frames: the output scales (keeping the aspect ratio).
             let dims = dev.activeFormat().formatDescription();
-            let d = objc2_core_media::CMVideoFormatDescriptionGetDimensions(&dims);
-            let (w, h) = camera_output_size((d.width, d.height), max_px);
-            out.setVideoSettings(Some(&crate::util::dict(vec![
+            let mut d = objc2_core_media::CMVideoFormatDescriptionGetDimensions(&dims);
+            if (d.width == 0 || d.height == 0)
+                && let Some((dw, dh)) = camera::device_dimensions(&dev)
+            {
+                d = objc2_core_media::CMVideoDimensions { width: dw as i32, height: dh as i32 };
+            }
+            let mut settings = vec![
                 (crate::util::cf_ns(kCVPixelBufferPixelFormatTypeKey), crate::util::num_i(crate::util::PIX_BGRA as i64)),
-                (crate::util::cf_ns(kCVPixelBufferWidthKey), crate::util::num_i(w)),
-                (crate::util::cf_ns(kCVPixelBufferHeightKey), crate::util::num_i(h)),
-            ])));
+            ];
+            if d.width > 0 && d.height > 0 {
+                let (w, h) = camera_output_size((d.width, d.height), max_px);
+                settings.push((crate::util::cf_ns(kCVPixelBufferWidthKey), crate::util::num_i(w)));
+                settings.push((crate::util::cf_ns(kCVPixelBufferHeightKey), crate::util::num_i(h)));
+            }
+            out.setVideoSettings(Some(&crate::util::dict(settings)));
             out.setAlwaysDiscardsLateVideoFrames(true);
             let latest = Arc::new(Mutex::new(None));
             let target = Arc::new(AtomicU64::new(0));
             // Also called when the session reports an error, so the UI looks.
             let on_frame = Arc::new(on_frame);
             let wake = on_frame.clone();
-            let output = PreviewOutput::create(latest.clone(), Arc::new(AtomicU32::new(0)), target.clone(), false, Box::new(move || on_frame()));
+            let output = PreviewOutput::create(latest.clone(), Arc::new(AtomicU32::new(0)), target.clone(), false, ios, Box::new(move || on_frame()));
             let queue = DispatchQueue::new("glide.preview.camera", None);
             out.setSampleBufferDelegate_queue(Some(ProtocolObject::from_ref(&*output)), Some(&queue));
             if !session.canAddOutput(&out) {
