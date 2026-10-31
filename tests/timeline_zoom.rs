@@ -1,14 +1,17 @@
 //! Drives the editor timeline with pointer events (no window) to check that
-//! a zoom segment can be trimmed from either edge as well as moved.
+//! a zoom segment can be trimmed from either edge as well as moved, and a
+//! clip edge follows the pointer from where the drag began.
 
 use egui::{Color32, Event, PointerButton, Pos2, Rect, Shape, vec2};
 use glide::app::editor::{Editor, Selection};
 use glide::app::home::{self, Devices, Settings, Thumbs};
-use glide::project::model::Zoom;
+use glide::project::model::{Mask, Zoom};
 use glide::render::Gpu;
 
 /// Zoom blocks are drawn with this fill (70 % unselected, 95 % selected).
 const ZOOM_PURPLE: Color32 = Color32::from_rgb(0x8b, 0x5c, 0xf6);
+/// Clip blocks use this fill, with the same two alphas.
+const CLIP_AMBER: Color32 = Color32::from_rgb(0xf5, 0x9e, 0x0b);
 
 struct Harness {
     ctx: egui::Context,
@@ -19,6 +22,8 @@ struct Harness {
     t: f64,
     /// Where the zoom block was painted in the last frame.
     zoom_rect: Option<Rect>,
+    /// Where the first clip block was painted in the last frame.
+    clip_rect: Option<Rect>,
 }
 
 impl Harness {
@@ -33,6 +38,7 @@ impl Harness {
             thumbs: Thumbs::default(),
             t: 0.0,
             zoom_rect: None,
+            clip_rect: None,
         }
     }
 
@@ -51,11 +57,15 @@ impl Harness {
             ed.ui(ui, renderer, &mut chrome);
         });
         out.textures_delta.clear();
-        let fills = [ZOOM_PURPLE.gamma_multiply(0.7), ZOOM_PURPLE.gamma_multiply(0.95)];
-        self.zoom_rect = out.shapes.iter().find_map(|s| match &s.shape {
-            Shape::Rect(r) if fills.contains(&r.fill) && r.rect.height() > 20.0 => Some(r.rect),
-            _ => None,
-        });
+        let block = |color: Color32| {
+            let fills = [color.gamma_multiply(0.7), color.gamma_multiply(0.95)];
+            out.shapes.iter().find_map(|s| match &s.shape {
+                Shape::Rect(r) if fills.contains(&r.fill) && r.rect.height() > 20.0 => Some(r.rect),
+                _ => None,
+            })
+        };
+        self.zoom_rect = block(ZOOM_PURPLE);
+        self.clip_rect = block(CLIP_AMBER);
     }
 
     fn pointer(&mut self, ed: &mut Editor, pos: Pos2, down: Option<bool>) {
@@ -217,5 +227,52 @@ fn zoom_edges_clamp_to_the_recording_when_dragged_far() {
     let z = zoom(&ed, id);
     assert_eq!(z.end, duration, "{z:?}");
     assert!(z.start < z.end);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn holding_a_clip_edge_keeps_the_trim_where_the_pointer_is() {
+    let gpu = Gpu::headless().unwrap();
+    let (mut ed, dir, _) = editor_with_zoom("clip-trim", gpu.clone());
+    let mut h = Harness::new(&gpu);
+    h.frame(&mut ed, vec![]);
+    h.frame(&mut ed, vec![]);
+    let r = h.clip_rect.expect("the clip block is on the timeline");
+    let y = r.center().y;
+    let slice = ed.project.timeline.slices[0];
+    assert_eq!((slice.start, slice.speed), (0.0, 1.0), "{slice:?}");
+
+    // Press on the left edge, move 100 px into the clip, then keep the pointer still.
+    let from = Pos2::new(r.left(), y);
+    let to = from + vec2(100.0, 0.0);
+    h.pointer(&mut ed, from, None);
+    h.pointer(&mut ed, from, Some(true));
+    // A slow start: egui reports the drag once the pointer is 6 px away, still inside the 7 px edge zone.
+    h.pointer(&mut ed, from + vec2(3.0, 0.0), None);
+    h.pointer(&mut ed, from + vec2(6.5, 0.0), None);
+    for i in 1..=6 {
+        h.pointer(&mut ed, from + (to - from) * (i as f32 / 6.0), None);
+    }
+    for _ in 0..10 {
+        h.pointer(&mut ed, to, None);
+    }
+    h.pointer(&mut ed, to, Some(false));
+    h.pointer(&mut ed, to, None);
+
+    let s = ed.project.timeline.slices[0];
+    let expected = 100.0 / ed.px_per_sec as f64 * 1000.0;
+    assert!((s.start - expected).abs() < 5.0, "start {} ms, expected about {expected} ms", s.start);
+    assert_eq!(s.end, slice.end, "the end must not move: {s:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+#[test]
+fn a_mask_added_at_the_end_is_visible() {
+    let gpu = Gpu::headless().unwrap();
+    let (mut ed, dir, _) = editor_with_zoom("mask-end", gpu);
+    let duration = ed.rec.meta.duration_ms;
+    ed.seek(ed.duration());
+    ed.add_mask();
+    let m = ed.project.timeline.masks.last().unwrap();
+    assert!(m.end <= duration && m.end - m.start >= Mask::MIN_LEN_MS, "{m:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -501,7 +501,10 @@ fn audio(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
             if ui.button("Choose…").clicked()
                 && let Some(f) = rfd::FileDialog::new().add_filter("Audio", &["mp3", "m4a", "wav", "aac", "aiff"]).pick_file()
             {
-                a.music = Some(f.to_string_lossy().into_owned());
+                match ed.package.import_asset(&f, "music") {
+                    Ok(rel) => a.music = Some(rel),
+                    Err(e) => ed.status = Some(format!("Couldn't use that music file: {e:#}")),
+                }
             }
             if a.music.is_some() && ui.button("Remove").clicked() {
                 a.music = None;
@@ -509,6 +512,9 @@ fn audio(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
         });
         if let Some(m) = &a.music {
             caption(ui, &std::path::Path::new(m).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+            if crate::export::audio::music_missing(Some(&ed.package.root), a) {
+                ui.label(RichText::new("Music file missing").size(theme::SECONDARY).color(Color32::from_rgb(255, 69, 58)));
+            }
             slider(ui, "Music volume", &mut a.music_volume, 0.0..=1.0, "");
         }
     });
